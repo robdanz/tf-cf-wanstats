@@ -64,12 +64,13 @@ npm install
 cp terraform/terraform.tfvars.example terraform/terraform.tfvars
 ```
 
-Edit `terraform/terraform.tfvars` and fill in all three values:
+Edit `terraform/terraform.tfvars` and fill in all four values:
 
 ```hcl
 cloudflare_account_id = "your-account-id"   # Workers & Pages → Overview → right sidebar
-cloudflare_api_token  = "..."                 # Terraform deploy token (see above)
-wan_api_token         = "..."                 # WAN analytics token (see above)
+workers_subdomain     = "your-subdomain"     # Workers & Pages → Overview → "Your subdomain" in right sidebar
+cloudflare_api_token  = "..."                # Terraform deploy token (see above)
+wan_api_token         = "..."                # WAN analytics token (see above)
 ```
 
 ### 3. Deploy
