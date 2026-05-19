@@ -10,6 +10,10 @@ cloudflare_account_id = "your-cloudflare-account-id"
 # Create at: https://dash.cloudflare.com/profile/api-tokens
 cloudflare_api_token = "your-terraform-api-token"
 
+# Your Cloudflare Workers subdomain (the part before .workers.dev).
+# Find at: Workers & Pages → Overview → 'Your subdomain' in the right sidebar.
+workers_subdomain = "your-subdomain"
+
 # Cloudflare API token for the worker to query WAN analytics at runtime.
 # Required permissions: Account > Account Analytics > Read
 # Create at: https://dash.cloudflare.com/profile/api-tokens

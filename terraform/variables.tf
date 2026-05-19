@@ -16,6 +16,11 @@ variable "cloudflare_api_token" {
   sensitive = true
 }
 
+variable "workers_subdomain" {
+  description = "Your Cloudflare Workers subdomain (the part before .workers.dev). Find at: Workers & Pages → Overview → 'Your subdomain' in the right sidebar."
+  type        = string
+}
+
 variable "wan_api_token" {
   description = <<-EOT
     Cloudflare API token used by the worker at runtime to query WAN tunnel analytics via the GraphQL API.

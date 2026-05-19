@@ -107,5 +107,5 @@ output "d1_database_id" {
 
 output "workers_dev_url" {
   description = "Workers.dev URL for the dashboard"
-  value       = "https://tf-cf-wanstats.${var.cloudflare_account_id}.workers.dev"
+  value       = "https://tf-cf-wanstats.${var.workers_subdomain}.workers.dev"
 }
