@@ -53,7 +53,7 @@ Used by the worker **at runtime** to query the GraphQL Analytics API. Stored as 
 ### 1. Clone and install
 
 ```bash
-git clone git@github.com:robdanz/tf-cf-wanstats.git
+git clone https://github.com/robdanz/tf-cf-wanstats.git
 cd tf-cf-wanstats/worker
 npm install
 ```
