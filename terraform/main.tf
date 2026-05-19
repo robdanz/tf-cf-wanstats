@@ -24,6 +24,13 @@ provider "cloudflare" {
 resource "cloudflare_d1_database" "metrics" {
   account_id = var.cloudflare_account_id
   name       = "tf-cf-wanstats-metrics"
+
+  # Provider v5 bug: sends read_replication=null on updates, which the API
+  # rejects with a 400. The database is created once and never modified,
+  # so ignore all post-creation changes.
+  lifecycle {
+    ignore_changes = all
+  }
 }
 
 # ── Render wrangler.jsonc from template ────────────────────────────────────────
