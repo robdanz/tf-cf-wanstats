@@ -50,7 +50,7 @@ Used by the worker **at runtime** to query the GraphQL Analytics API. Stored as 
 
 ## Setup
 
-### 1. Clone and install
+### 1. Clone and install dependencies
 
 ```bash
 git clone https://github.com/robdanz/tf-cf-wanstats.git
@@ -58,10 +58,18 @@ cd tf-cf-wanstats/worker
 npm install
 ```
 
-### 2. Configure Terraform variables
+### 2. Type-check the worker
 
 ```bash
-cp terraform/terraform.tfvars.example terraform/terraform.tfvars
+npm run typecheck
+```
+
+Fix any TypeScript errors before deploying. This is a no-output build step — it compiles but produces no files. Wrangler bundles the TypeScript at deploy time.
+
+### 3. Configure Terraform variables
+
+```bash
+cp ../terraform/terraform.tfvars.example ../terraform/terraform.tfvars
 ```
 
 Edit `terraform/terraform.tfvars` and fill in all four values:
@@ -73,21 +81,23 @@ cloudflare_api_token  = "..."                # Terraform deploy token (see above
 wan_api_token         = "..."                # WAN analytics token (see above)
 ```
 
-### 3. Deploy
+### 4. Deploy with Terraform
 
 ```bash
-cd terraform
-terraform init
-terraform plan   # review: D1 database, migration, deploy, secret
+cd ../terraform
+terraform init   # first time only — downloads providers
+terraform plan   # preview what will be created
 terraform apply
 ```
 
-Terraform will, in order:
+Terraform runs the full deployment in order:
 1. Create the D1 database `tf-cf-wanstats-metrics`
-2. Render `worker/wrangler.jsonc` from the template (filling in account ID and D1 database ID)
-3. Run the D1 migration (`migrations/0001_initial.sql`)
-4. Deploy the worker via `wrangler deploy`
+2. Render `worker/wrangler.jsonc` from the template (fills in account ID and D1 database ID)
+3. Apply the D1 schema migration (`migrations/0001_initial.sql`)
+4. Run `npm install && wrangler deploy` in the `worker/` directory to bundle and deploy the worker
 5. Set the `WAN_API_TOKEN` Worker secret via `wrangler secret put`
+
+The workers.dev URL is printed as `workers_dev_url` when apply completes.
 
 ### 4. Verify
 
@@ -138,13 +148,12 @@ The workers.dev URL is publicly accessible by default. To restrict it:
 
 ## Re-deploying after code changes
 
-Run `terraform apply` — it detects changes via `filesha256` on `worker/src/index.ts` and re-deploys automatically.
-
-To deploy without Terraform:
 ```bash
-cd worker
-npx wrangler deploy   # requires CLOUDFLARE_API_TOKEN or wrangler login
+cd worker && npm run typecheck   # verify before deploying
+cd ../terraform && terraform apply
 ```
+
+Terraform detects changes via `filesha256` on `worker/src/index.ts` and re-runs `wrangler deploy` automatically. No manual wrangler commands needed.
 
 ## Data retention
 
