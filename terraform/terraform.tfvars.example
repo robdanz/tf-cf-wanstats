@@ -1,0 +1,16 @@
+# Copy this file to terraform.tfvars and fill in your values.
+# terraform.tfvars is gitignored and never committed.
+
+# Your Cloudflare Account ID.
+# Find at: Workers & Pages → Overview → right sidebar.
+cloudflare_account_id = "your-cloudflare-account-id"
+
+# Cloudflare API token for Terraform deployment.
+# Required permissions: Account > D1 > Edit, Account > Workers Scripts > Edit, Account > Account Settings > Read
+# Create at: https://dash.cloudflare.com/profile/api-tokens
+cloudflare_api_token = "your-terraform-api-token"
+
+# Cloudflare API token for the worker to query WAN analytics at runtime.
+# Required permissions: Account > Account Analytics > Read
+# Create at: https://dash.cloudflare.com/profile/api-tokens
+wan_api_token = "your-wan-analytics-api-token"

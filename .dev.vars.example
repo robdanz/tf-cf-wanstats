@@ -1,0 +1,11 @@
+# Copy this file to .dev.vars and fill in your values for local development.
+# .dev.vars is gitignored and never committed.
+#
+# WAN_API_TOKEN: Cloudflare API token with "Account Analytics: Read" permission.
+# Create at: https://dash.cloudflare.com/profile/api-tokens
+# → Create Token → Custom token → Permissions: Account > Account Analytics > Read
+#
+# ACCOUNT_ID: Your Cloudflare Account ID.
+# Find at: Workers & Pages → Overview → right sidebar.
+WAN_API_TOKEN=
+ACCOUNT_ID=

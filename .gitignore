@@ -1,0 +1,20 @@
+node_modules/
+.dev.vars
+.wrangler/
+dist/
+.env*
+.DS_Store
+*.log
+
+# Terraform
+terraform/terraform.tfvars
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+terraform/terraform.tfstate
+terraform/terraform.tfstate.backup
+
+# Wrangler generated config (rendered from template by Terraform)
+worker/wrangler.jsonc
+
+# Setup instructions (local only)
+AI-SETUP-INSTRUCTIONS.md
