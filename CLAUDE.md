@@ -73,3 +73,40 @@ Re-deploy is triggered automatically by `terraform apply` when `filesha256("work
 - **GraphQL `limit: 100`.** If tunnel count exceeds ~50 (ingress + egress = 2 rows per tunnel per query), add pagination to `fetchTunnelMetrics`.
 - **No `cloudflare_workers_secret` resource in provider v5.** Secrets are set via `wrangler secret put` in a `null_resource` provisioner.
 - **Two API tokens** are required (see `terraform/variables.tf` descriptions): deploy token (`Workers Scripts + D1 + Account Settings: Edit`) and runtime token (`Account Analytics: Read` only, stored as `WAN_API_TOKEN` Worker secret).
+
+## Known Cloudflare API limitation — DO NOT re-investigate without first verifying
+
+**`magicTransitTunnelTrafficAdaptiveGroups` returns `tunnelName: ""` for this account.**
+
+This was fully investigated. The Cloudflare GraphQL API returns real traffic bit-rate data from this dataset but does not attribute it to named tunnels — `tunnelName` is always an empty string. Filtering by a specific tunnel name returns zero results. This is a Cloudflare-side data pipeline issue, not a bug in the worker code.
+
+What was confirmed working:
+- `magicTransitTunnelHealthChecksAdaptiveGroups` — correctly returns tunnel names and health state (tunnels are healthy and named)
+- The query structure, field names (`tunnelName`, `datetimeFiveMinutes`), and direction values (`"ingress"`, `"egress"`) are all correct per Cloudflare docs
+
+What was confirmed NOT applicable to this account:
+- `mconnTelemetrySnapshotNetdevsAdaptiveGroups` — Magic WAN Connector (hardware appliance) dataset; returned no data
+- `magicWANConnectorMetricsAdaptiveGroups` — deprecated Connector metrics; not applicable
+
+**Before re-deploying**, verify that `magicTransitTunnelTrafficAdaptiveGroups` now populates `tunnelName` by running this query in the Cloudflare GraphQL Explorer:
+
+```graphql
+{
+  viewer {
+    accounts(filter: { accountTag: "<ACCOUNT_ID>" }) {
+      magicTransitTunnelTrafficAdaptiveGroups(
+        limit: 5,
+        filter: {
+          datetime_geq: "<recent-datetime>",
+          datetime_lt: "<now>"
+        }
+      ) {
+        avg { bitRateFiveMinutes }
+        dimensions { tunnelName direction datetimeFiveMinutes }
+      }
+    }
+  }
+}
+```
+
+If `tunnelName` is still `""`, the underlying data issue is not resolved and deploying will result in blank tunnel names in D1. The dashboard spec and all worker code are correct and ready — this is purely a data availability blocker.
