@@ -86,6 +86,7 @@ async function fetchTunnelMetrics(
   }
 
   const json = (await response.json()) as GraphQLResponse;
+  console.log(`GraphQL response (${direction}):`, JSON.stringify(json).slice(0, 2000));
   if (json.errors?.length) {
     throw new Error(`GraphQL errors: ${json.errors.map((e) => e.message).join(', ')}`);
   }
@@ -133,6 +134,9 @@ async function handleCron(env: Env): Promise<void> {
   ]);
 
   console.log(`Fetched ${ingressRows.length} ingress rows, ${egressRows.length} egress rows`);
+  if (ingressRows.length > 0) {
+    console.log('Sample ingress row dimensions:', JSON.stringify(ingressRows[0].dimensions));
+  }
 
   await Promise.all([
     storeTunnelMetrics(env.DB, ingressRows, 'ingress'),
