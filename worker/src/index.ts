@@ -361,7 +361,7 @@ function getDashboardHTML(): string {
         <div class="summary-card card-count">
           <div class="label">Tunnels</div>
           <div class="value" id="tunnel-count">--</div>
-          <div class="sublabel">configured</div>
+          <div class="sublabel">with data in selected range</div>
         </div>
         <div class="summary-card card-ingress">
           <div class="label">p95 Ingress &mdash; all tunnels</div>
