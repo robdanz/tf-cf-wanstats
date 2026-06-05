@@ -4,25 +4,37 @@ interface Env {
   ACCOUNT_ID: string;    // Cloudflare account ID (non-secret var)
 }
 
-// Cloudflare docs are inconsistent: examples show both `datetimeFiveMinute`
-// (singular) and `datetimeFiveMinutes` (plural). Accept both so cron writes
-// never silently fail if the API returns the singular form.
-interface TunnelMetricDimensions {
-  tunnelName: string;
+// magicTransitNetworkAnalyticsAdaptiveGroups returns separate tunnel name fields
+// per direction — ingressTunnelName and egressTunnelName — rather than a unified
+// tunnelName + direction pair. Accept both datetime field spellings defensively.
+interface IngressDimensions {
+  ingressTunnelName: string;
   datetimeFiveMinutes?: string;
   datetimeFiveMinute?: string;
 }
 
-interface TunnelMetricRow {
+interface EgressDimensions {
+  egressTunnelName: string;
+  datetimeFiveMinutes?: string;
+  datetimeFiveMinute?: string;
+}
+
+interface IngressRow {
   avg: { bitRateFiveMinutes: number };
-  dimensions: TunnelMetricDimensions;
+  dimensions: IngressDimensions;
+}
+
+interface EgressRow {
+  avg: { bitRateFiveMinutes: number };
+  dimensions: EgressDimensions;
 }
 
 interface GraphQLResponse {
   data?: {
     viewer: {
       accounts: Array<{
-        magicTransitTunnelTrafficAdaptiveGroups: TunnelMetricRow[];
+        ingress: IngressRow[];
+        egress: EgressRow[];
       }>;
     };
   };
@@ -30,29 +42,45 @@ interface GraphQLResponse {
 }
 
 // ── GraphQL query ─────────────────────────────────────────────────────────────
+// Uses magicTransitNetworkAnalyticsAdaptiveGroups, which correctly populates
+// ingressTunnelName / egressTunnelName for this account. A single request
+// fetches both directions via aliases. Filters out blank and "device_id" rows.
 const GRAPHQL_QUERY = `
-  query GetTunnelBandwidth(
+  query MwanTunnelBitrate(
     $accountTag: string,
     $datetimeStart: string,
-    $datetimeEnd: string,
-    $direction: string
+    $datetimeEnd: string
   ) {
     viewer {
       accounts(filter: { accountTag: $accountTag }) {
-        magicTransitTunnelTrafficAdaptiveGroups(
-          limit: 100,
+        ingress: magicTransitNetworkAnalyticsAdaptiveGroups(
           filter: {
             datetime_geq: $datetimeStart,
             datetime_lt: $datetimeEnd,
-            direction: $direction
+            ingressTunnelName_notin: ["", "device_id"]
           }
+          limit: 1000
+          orderBy: [datetimeFiveMinutes_ASC]
         ) {
-          avg {
-            bitRateFiveMinutes
-          }
+          avg { bitRateFiveMinutes }
           dimensions {
-            tunnelName
             datetimeFiveMinutes
+            ingressTunnelName
+          }
+        }
+        egress: magicTransitNetworkAnalyticsAdaptiveGroups(
+          filter: {
+            datetime_geq: $datetimeStart,
+            datetime_lt: $datetimeEnd,
+            egressTunnelName_notin: ["", "device_id"]
+          }
+          limit: 1000
+          orderBy: [datetimeFiveMinutes_ASC]
+        ) {
+          avg { bitRateFiveMinutes }
+          dimensions {
+            datetimeFiveMinutes
+            egressTunnelName
           }
         }
       }
@@ -62,13 +90,12 @@ const GRAPHQL_QUERY = `
 
 // ── API polling ───────────────────────────────────────────────────────────────
 
-async function fetchTunnelMetrics(
+async function fetchAllTunnelMetrics(
   accountId: string,
   apiToken: string,
-  direction: 'ingress' | 'egress',
   datetimeStart: string,
   datetimeEnd: string,
-): Promise<TunnelMetricRow[]> {
+): Promise<{ ingress: IngressRow[]; egress: EgressRow[] }> {
   const response = await fetch('https://api.cloudflare.com/client/v4/graphql', {
     method: 'POST',
     headers: {
@@ -77,7 +104,7 @@ async function fetchTunnelMetrics(
     },
     body: JSON.stringify({
       query: GRAPHQL_QUERY,
-      variables: { accountTag: accountId, direction, datetimeStart, datetimeEnd },
+      variables: { accountTag: accountId, datetimeStart, datetimeEnd },
     }),
   });
 
@@ -86,19 +113,23 @@ async function fetchTunnelMetrics(
   }
 
   const json = (await response.json()) as GraphQLResponse;
-  console.log(`GraphQL response (${direction}):`, JSON.stringify(json).slice(0, 2000));
+  console.log('GraphQL response:', JSON.stringify(json).slice(0, 2000));
   if (json.errors?.length) {
     throw new Error(`GraphQL errors: ${json.errors.map((e) => e.message).join(', ')}`);
   }
 
-  return json.data?.viewer.accounts[0]?.magicTransitTunnelTrafficAdaptiveGroups ?? [];
+  const account = json.data?.viewer.accounts[0];
+  return {
+    ingress: account?.ingress ?? [],
+    egress: account?.egress ?? [],
+  };
 }
 
 // ── D1 storage ────────────────────────────────────────────────────────────────
 
 async function storeTunnelMetrics(
   db: D1Database,
-  rows: TunnelMetricRow[],
+  rows: Array<{ tunnelName: string; ts: string; bitRate: number }>,
   direction: 'ingress' | 'egress',
 ): Promise<void> {
   if (rows.length === 0) return;
@@ -106,16 +137,13 @@ async function storeTunnelMetrics(
   for (let i = 0; i < rows.length; i += BATCH_SIZE) {
     const chunk = rows.slice(i, i + BATCH_SIZE);
     await db.batch(
-      chunk.map((row) => {
-        // Accept both field name variants from the Cloudflare API
-        const ts = row.dimensions.datetimeFiveMinutes ?? row.dimensions.datetimeFiveMinute;
-        if (!ts) throw new Error(`Missing datetime dimension for tunnel ${row.dimensions.tunnelName}`);
-        return db
+      chunk.map((row) =>
+        db
           .prepare(
             'INSERT OR REPLACE INTO tunnel_metrics (tunnel_name, direction, ts, bit_rate) VALUES (?, ?, ?, ?)',
           )
-          .bind(row.dimensions.tunnelName, direction, ts, row.avg.bitRateFiveMinutes);
-      }),
+          .bind(row.tunnelName, direction, row.ts, row.bitRate),
+      ),
     );
   }
 }
@@ -128,19 +156,33 @@ async function handleCron(env: Env): Promise<void> {
   const datetimeEnd = now.toISOString();
   const datetimeStart = tenMinutesAgo.toISOString();
 
-  const [ingressRows, egressRows] = await Promise.all([
-    fetchTunnelMetrics(env.ACCOUNT_ID, env.WAN_API_TOKEN, 'ingress', datetimeStart, datetimeEnd),
-    fetchTunnelMetrics(env.ACCOUNT_ID, env.WAN_API_TOKEN, 'egress', datetimeStart, datetimeEnd),
-  ]);
+  const { ingress: ingressRows, egress: egressRows } = await fetchAllTunnelMetrics(
+    env.ACCOUNT_ID,
+    env.WAN_API_TOKEN,
+    datetimeStart,
+    datetimeEnd,
+  );
 
   console.log(`Fetched ${ingressRows.length} ingress rows, ${egressRows.length} egress rows`);
   if (ingressRows.length > 0) {
     console.log('Sample ingress row dimensions:', JSON.stringify(ingressRows[0].dimensions));
   }
 
+  const normalizedIngress = ingressRows.map((row) => {
+    const ts = row.dimensions.datetimeFiveMinutes ?? row.dimensions.datetimeFiveMinute;
+    if (!ts) throw new Error(`Missing datetime for ingress tunnel ${row.dimensions.ingressTunnelName}`);
+    return { tunnelName: row.dimensions.ingressTunnelName, ts, bitRate: row.avg.bitRateFiveMinutes };
+  });
+
+  const normalizedEgress = egressRows.map((row) => {
+    const ts = row.dimensions.datetimeFiveMinutes ?? row.dimensions.datetimeFiveMinute;
+    if (!ts) throw new Error(`Missing datetime for egress tunnel ${row.dimensions.egressTunnelName}`);
+    return { tunnelName: row.dimensions.egressTunnelName, ts, bitRate: row.avg.bitRateFiveMinutes };
+  });
+
   await Promise.all([
-    storeTunnelMetrics(env.DB, ingressRows, 'ingress'),
-    storeTunnelMetrics(env.DB, egressRows, 'egress'),
+    storeTunnelMetrics(env.DB, normalizedIngress, 'ingress'),
+    storeTunnelMetrics(env.DB, normalizedEgress, 'egress'),
   ]);
 
   console.log('Metrics stored successfully');
