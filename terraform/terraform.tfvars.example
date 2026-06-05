@@ -18,3 +18,7 @@ workers_subdomain = "your-subdomain"
 # Required permissions: Account > Account Analytics > Read
 # Create at: https://dash.cloudflare.com/profile/api-tokens
 wan_api_token = "your-wan-analytics-api-token"
+
+# Secret token for authenticating POST /api/backfill requests.
+# Generate with: openssl rand -hex 32
+backfill_token = "your-backfill-token"

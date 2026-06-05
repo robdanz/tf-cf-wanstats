@@ -21,6 +21,17 @@ variable "workers_subdomain" {
   type        = string
 }
 
+variable "backfill_token" {
+  description = <<-EOT
+    Secret token for authenticating POST /api/backfill requests.
+    Passed as X-Backfill-Token header by the backfill shell script.
+    Generate with: openssl rand -hex 32
+    Stored as a Worker secret (BACKFILL_TOKEN) — never appears in wrangler.jsonc or logs.
+  EOT
+  type      = string
+  sensitive = true
+}
+
 variable "wan_api_token" {
   description = <<-EOT
     Cloudflare API token used by the worker at runtime to query WAN tunnel analytics via the GraphQL API.

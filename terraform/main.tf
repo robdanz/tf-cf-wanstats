@@ -105,6 +105,23 @@ resource "null_resource" "set_wan_api_token" {
   }
 }
 
+resource "null_resource" "set_backfill_token" {
+  depends_on = [null_resource.deploy]
+
+  triggers = {
+    token_hash = sha256(var.backfill_token)
+  }
+
+  provisioner "local-exec" {
+    working_dir = "${path.module}/../worker"
+    command     = "printf '%s' \"$SECRET_VALUE\" | npx wrangler secret put BACKFILL_TOKEN"
+    environment = {
+      CLOUDFLARE_API_TOKEN = var.cloudflare_api_token
+      SECRET_VALUE         = var.backfill_token
+    }
+  }
+}
+
 # ── Outputs ───────────────────────────────────────────────────────────────────
 
 output "d1_database_id" {

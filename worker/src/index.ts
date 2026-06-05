@@ -1,7 +1,8 @@
 interface Env {
   DB: D1Database;
-  WAN_API_TOKEN: string; // Cloudflare API token — Account Analytics: Read
-  ACCOUNT_ID: string;    // Cloudflare account ID (non-secret var)
+  WAN_API_TOKEN: string;    // Cloudflare API token — Account Analytics: Read
+  ACCOUNT_ID: string;       // Cloudflare account ID (non-secret var)
+  BACKFILL_TOKEN: string;   // Secret for authenticating POST /api/backfill
 }
 
 // magicTransitNetworkAnalyticsAdaptiveGroups returns separate tunnel name fields
@@ -39,6 +40,19 @@ interface GraphQLResponse {
     };
   };
   errors?: Array<{ message: string }>;
+}
+
+// ── Token verification ────────────────────────────────────────────────────────
+// Timing-safe comparison via SHA-256 digest XOR reduction — prevents token
+// length/content leakage through response timing.
+
+async function verifyToken(provided: string, expected: string): Promise<boolean> {
+  const enc = new TextEncoder();
+  const a = new Uint8Array(await crypto.subtle.digest('SHA-256', enc.encode(provided)));
+  const b = new Uint8Array(await crypto.subtle.digest('SHA-256', enc.encode(expected)));
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+  return diff === 0;
 }
 
 // ── GraphQL query ─────────────────────────────────────────────────────────────
@@ -148,13 +162,39 @@ async function storeTunnelMetrics(
   }
 }
 
+// ── Normalization ─────────────────────────────────────────────────────────────
+// Converts raw API rows into the flat shape expected by storeTunnelMetrics.
+
+type NormalizedRow = { tunnelName: string; ts: string; bitRate: number };
+
+function normalizeMetrics(
+  ingressRows: IngressRow[],
+  egressRows: EgressRow[],
+): { ingress: NormalizedRow[]; egress: NormalizedRow[] } {
+  const ingress = ingressRows.map((row) => {
+    const ts = row.dimensions.datetimeFiveMinutes ?? row.dimensions.datetimeFiveMinute;
+    if (!ts) throw new Error(`Missing datetime for ingress tunnel ${row.dimensions.ingressTunnelName}`);
+    return { tunnelName: row.dimensions.ingressTunnelName, ts, bitRate: row.avg.bitRateFiveMinutes };
+  });
+
+  const egress = egressRows.map((row) => {
+    const ts = row.dimensions.datetimeFiveMinutes ?? row.dimensions.datetimeFiveMinute;
+    if (!ts) throw new Error(`Missing datetime for egress tunnel ${row.dimensions.egressTunnelName}`);
+    return { tunnelName: row.dimensions.egressTunnelName, ts, bitRate: row.avg.bitRateFiveMinutes };
+  });
+
+  return { ingress, egress };
+}
+
 // ── Cron handler ──────────────────────────────────────────────────────────────
+// Fires every hour. Queries the last 65 minutes (extra slack for API latency).
+// INSERT OR REPLACE deduplicates any overlap with previous runs.
 
 async function handleCron(env: Env): Promise<void> {
   const now = new Date();
-  const tenMinutesAgo = new Date(now.getTime() - 10 * 60 * 1000);
+  const sixtyFiveMinutesAgo = new Date(now.getTime() - 65 * 60 * 1000);
   const datetimeEnd = now.toISOString();
-  const datetimeStart = tenMinutesAgo.toISOString();
+  const datetimeStart = sixtyFiveMinutesAgo.toISOString();
 
   const { ingress: ingressRows, egress: egressRows } = await fetchAllTunnelMetrics(
     env.ACCOUNT_ID,
@@ -168,24 +208,62 @@ async function handleCron(env: Env): Promise<void> {
     console.log('Sample ingress row dimensions:', JSON.stringify(ingressRows[0].dimensions));
   }
 
-  const normalizedIngress = ingressRows.map((row) => {
-    const ts = row.dimensions.datetimeFiveMinutes ?? row.dimensions.datetimeFiveMinute;
-    if (!ts) throw new Error(`Missing datetime for ingress tunnel ${row.dimensions.ingressTunnelName}`);
-    return { tunnelName: row.dimensions.ingressTunnelName, ts, bitRate: row.avg.bitRateFiveMinutes };
-  });
-
-  const normalizedEgress = egressRows.map((row) => {
-    const ts = row.dimensions.datetimeFiveMinutes ?? row.dimensions.datetimeFiveMinute;
-    if (!ts) throw new Error(`Missing datetime for egress tunnel ${row.dimensions.egressTunnelName}`);
-    return { tunnelName: row.dimensions.egressTunnelName, ts, bitRate: row.avg.bitRateFiveMinutes };
-  });
+  const { ingress, egress } = normalizeMetrics(ingressRows, egressRows);
 
   await Promise.all([
-    storeTunnelMetrics(env.DB, normalizedIngress, 'ingress'),
-    storeTunnelMetrics(env.DB, normalizedEgress, 'egress'),
+    storeTunnelMetrics(env.DB, ingress, 'ingress'),
+    storeTunnelMetrics(env.DB, egress, 'egress'),
   ]);
 
   console.log('Metrics stored successfully');
+}
+
+// ── Backfill handler ──────────────────────────────────────────────────────────
+// POST /api/backfill?start=ISO&end=ISO
+// Header: X-Backfill-Token: <BACKFILL_TOKEN>
+// Queries one time window and upserts results. Idempotent — safe to re-run.
+// Keep each window to ~1 hour to stay within the GraphQL limit: 1000 rows.
+
+async function handleBackfill(request: Request, env: Env): Promise<Response> {
+  const provided = request.headers.get('X-Backfill-Token') ?? '';
+  if (!(await verifyToken(provided, env.BACKFILL_TOKEN))) {
+    return new Response('Unauthorized', { status: 401 });
+  }
+
+  const url = new URL(request.url);
+  const start = url.searchParams.get('start');
+  const end = url.searchParams.get('end');
+
+  if (!start || !end) {
+    return new Response('Missing start or end query param', { status: 400 });
+  }
+  if (isNaN(Date.parse(start)) || isNaN(Date.parse(end))) {
+    return new Response('Invalid datetime format — use ISO 8601', { status: 400 });
+  }
+  if (new Date(start) >= new Date(end)) {
+    return new Response('start must be before end', { status: 400 });
+  }
+
+  const { ingress: ingressRows, egress: egressRows } = await fetchAllTunnelMetrics(
+    env.ACCOUNT_ID,
+    env.WAN_API_TOKEN,
+    start,
+    end,
+  );
+
+  const { ingress, egress } = normalizeMetrics(ingressRows, egressRows);
+
+  await Promise.all([
+    storeTunnelMetrics(env.DB, ingress, 'ingress'),
+    storeTunnelMetrics(env.DB, egress, 'egress'),
+  ]);
+
+  return Response.json({
+    start,
+    end,
+    ingress_rows: ingress.length,
+    egress_rows: egress.length,
+  });
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -811,6 +889,10 @@ export default {
       return new Response(getDashboardHTML(), {
         headers: { 'Content-Type': 'text/html; charset=utf-8' },
       });
+    }
+
+    if (url.pathname === '/api/backfill' && request.method === 'POST') {
+      return handleBackfill(request, env);
     }
 
     if (url.pathname.startsWith('/api/')) {
