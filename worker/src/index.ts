@@ -268,13 +268,19 @@ async function handleBackfill(request: Request, env: Env): Promise<Response> {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+// 24h: rolling window from now — shows today's live data.
+// 7d / 30d: aligned to UTC midnight boundaries so results represent complete
+// calendar days. E.g. "7d" = midnight 7 days ago through end of yesterday,
+// not a rolling 168-hour window.
 function rangeToSince(range: string): string {
-  const offsets: Record<string, number> = {
-    '24h': 24 * 60 * 60 * 1000,
-    '7d': 7 * 24 * 60 * 60 * 1000,
-    '30d': 30 * 24 * 60 * 60 * 1000,
-  };
-  return new Date(Date.now() - (offsets[range] ?? offsets['24h'])).toISOString();
+  if (range === '7d' || range === '30d') {
+    const days = range === '7d' ? 7 : 30;
+    const d = new Date();
+    d.setUTCHours(0, 0, 0, 0);         // snap to start of today (UTC)
+    d.setUTCDate(d.getUTCDate() - days); // back N days
+    return d.toISOString();
+  }
+  return new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
 }
 
 // ── SQL constants ─────────────────────────────────────────────────────────────
@@ -293,11 +299,13 @@ const P95_PER_TUNNEL_SQL = `
 
 // Aggregate p95: sum all tunnels per 5-min interval, then p95 of those sums.
 // Mirrors Cloudflare's billing methodology.
+// Bind params: direction, since, excludeJson (JSON array of excluded tunnel names — pass '[]' to include all)
 const P95_AGGREGATE_SQL = `
   WITH totals AS (
     SELECT ts, SUM(bit_rate) AS val
     FROM tunnel_metrics
     WHERE direction = ? AND ts >= ?
+      AND tunnel_name NOT IN (SELECT value FROM json_each(?))
     GROUP BY ts
   ),
   ranked AS (
@@ -365,11 +373,15 @@ async function handleApiRequest(request: Request, env: Env): Promise<Response> {
     });
   }
 
-  // GET /api/summary?range= — aggregate p95 across all tunnels
+  // GET /api/summary?range=&exclude=name1,name2 — aggregate p95, optionally excluding tunnels
   if (pathname === '/api/summary') {
+    const excludeParam = url.searchParams.get('exclude') ?? '';
+    const excludeList = excludeParam ? excludeParam.split(',').map(decodeURIComponent) : [];
+    const excludeJson = JSON.stringify(excludeList);
+
     const [p95In, p95Eg] = await Promise.all([
-      env.DB.prepare(P95_AGGREGATE_SQL).bind('ingress', since).first<{ val: number }>(),
-      env.DB.prepare(P95_AGGREGATE_SQL).bind('egress', since).first<{ val: number }>(),
+      env.DB.prepare(P95_AGGREGATE_SQL).bind('ingress', since, excludeJson).first<{ val: number }>(),
+      env.DB.prepare(P95_AGGREGATE_SQL).bind('egress', since, excludeJson).first<{ val: number }>(),
     ]);
 
     return Response.json({
@@ -467,6 +479,12 @@ function getDashboardHTML(): string {
     .p95-btn { flex-shrink: 0; font-size: 0.75rem; padding: .3rem .75rem; border: 1px solid #d1d5db; border-radius: 5px; cursor: pointer; background: white; color: #374151; }
     .p95-btn:hover { background: #f9fafb; }
     .p95-btn.active { background: #eff6ff; border-color: #93c5fd; color: #1d4ed8; }
+    .excl-btn { flex-shrink: 0; font-size: 0.75rem; padding: .3rem .75rem; border: 1px solid #d1d5db; border-radius: 5px; cursor: pointer; background: white; color: #6b7280; margin-left: .4rem; }
+    .excl-btn:hover { background: #f9fafb; }
+    .excl-btn.excluded { background: #fef2f2; border-color: #fca5a5; color: #dc2626; }
+    .tunnel-card.excluded { opacity: 0.4; }
+    .clear-excl-btn { padding: .42rem .85rem; border: 1px solid #fca5a5; border-radius: 6px; font-size: 0.875rem; background: #fef2f2; color: #dc2626; cursor: pointer; white-space: nowrap; }
+    .clear-excl-btn:hover { background: #fee2e2; }
     .chart-wrap { position: relative; }
     .chart-loading { padding: 3rem; text-align: center; font-size: 0.85rem; color: #9ca3af; }
     canvas { max-height: 260px; display: none; }
@@ -516,6 +534,7 @@ function getDashboardHTML(): string {
         <option value="p95-egress">Sort: p95 egress highest</option>
         <option value="name">Sort: name A\u2013Z</option>
       </select>
+      <button id="clear-excl" class="clear-excl-btn" onclick="clearExclusions()" style="display:none">Clear exclusions (<span id="excl-count">0</span>)</button>
     </div>
 
     <div class="pagination" id="pag-top">
@@ -534,13 +553,70 @@ function getDashboardHTML(): string {
 
   </div>
   <script>
-    var PAGE_SIZE    = 20;
-    var allTunnels   = [];   // [{name, p95_ingress_bps, p95_egress_bps}] — full list
-    var filteredList = [];   // sorted + filtered subset
-    var currentPage  = 0;
-    var metricsCache = {};   // key: 'name::range' -> metrics response
-    var activeCharts = {};   // key: tunnel name -> Chart instance
-    var pendingCards = {};   // key: tunnel name -> canvas element (in-flight fetch)
+    var PAGE_SIZE      = 20;
+    var allTunnels     = [];   // [{name, p95_ingress_bps, p95_egress_bps}] — full list
+    var filteredList   = [];   // sorted + filtered subset
+    var currentPage    = 0;
+    var metricsCache   = {};   // key: 'name::range' -> metrics response
+    var activeCharts   = {};   // key: tunnel name -> Chart instance
+    var pendingCards   = {};   // key: tunnel name -> canvas element (in-flight fetch)
+    var excludedTunnels = {}; // key: tunnel name -> true; persisted in localStorage
+
+    // ── Exclusion helpers ────────────────────────────────────────────────────
+
+    function loadExclusions() {
+      try { excludedTunnels = JSON.parse(localStorage.getItem('wanstats_excl') || '{}'); }
+      catch(e) { excludedTunnels = {}; }
+    }
+
+    function saveExclusions() {
+      localStorage.setItem('wanstats_excl', JSON.stringify(excludedTunnels));
+    }
+
+    function updateExclCount() {
+      var n   = Object.keys(excludedTunnels).length;
+      var btn = document.getElementById('clear-excl');
+      var cnt = document.getElementById('excl-count');
+      if (btn) btn.style.display = n > 0 ? 'inline-block' : 'none';
+      if (cnt) cnt.textContent   = n;
+      var included = allTunnels.filter(function(t) { return !excludedTunnels[t.name]; }).length;
+      var countEl  = document.getElementById('tunnel-count');
+      if (countEl) countEl.textContent = n > 0 ? included + ' (' + n + ' excl.)' : included.toString();
+    }
+
+    function refreshSummary() {
+      var range = document.getElementById('range').value;
+      var excl  = Object.keys(excludedTunnels);
+      var q     = '/api/summary?range=' + range + (excl.length ? '&exclude=' + excl.map(encodeURIComponent).join(',') : '');
+      fetch(q)
+        .then(function(r) { return r.json(); })
+        .then(function(s) {
+          document.getElementById('p95-ingress').textContent = formatBps(s.p95_ingress_bps);
+          document.getElementById('p95-egress').textContent  = formatBps(s.p95_egress_bps);
+        });
+    }
+
+    function toggleExclusion(name) {
+      if (excludedTunnels[name]) { delete excludedTunnels[name]; } else { excludedTunnels[name] = true; }
+      saveExclusions();
+      metricsCache = {}; // chart data still valid but don't re-fetch on exclusion toggle
+      updateExclCount();
+      refreshSummary();
+      applyFilters();
+      renderCurrentPage();
+      updatePagination();
+    }
+
+    function clearExclusions() {
+      excludedTunnels = {};
+      saveExclusions();
+      metricsCache = {};
+      updateExclCount();
+      refreshSummary();
+      applyFilters();
+      renderCurrentPage();
+      updatePagination();
+    }
 
     function formatBps(bps) {
       if (bps === null || bps === undefined) return 'N/A';
@@ -571,6 +647,10 @@ function getDashboardHTML(): string {
       });
 
       filtered.sort(function(a, b) {
+        // Excluded tunnels always sort to the bottom
+        var aEx = !!excludedTunnels[a.name];
+        var bEx = !!excludedTunnels[b.name];
+        if (aEx !== bEx) return aEx ? 1 : -1;
         if (sort === 'name')        return a.name.localeCompare(b.name);
         if (sort === 'p95-ingress') return (b.p95_ingress_bps || 0) - (a.p95_ingress_bps || 0);
         if (sort === 'p95-egress')  return (b.p95_egress_bps  || 0) - (a.p95_egress_bps  || 0);
@@ -643,6 +723,9 @@ function getDashboardHTML(): string {
         var canvas   = renderTunnelCard(t);
         var cacheKey = t.name + '::' + range;
 
+        // Skip chart for excluded tunnels — they're greyed out, no data needed
+        if (excludedTunnels[t.name]) return;
+
         if (metricsCache[cacheKey]) {
           populateChart(t.name, canvas, metricsCache[cacheKey]);
         } else {
@@ -666,10 +749,11 @@ function getDashboardHTML(): string {
     }
 
     function renderTunnelCard(t) {
+      var isExcluded = !!excludedTunnels[t.name];
       var card = document.createElement('div');
-      card.className = 'tunnel-card';
+      card.className = 'tunnel-card' + (isExcluded ? ' excluded' : '');
 
-      // Header: meta (name + p95 badges) + toggle button
+      // Header: meta (name + p95 badges) + action buttons
       var header = document.createElement('div');
       header.className = 'tunnel-header';
 
@@ -696,6 +780,10 @@ function getDashboardHTML(): string {
       meta.appendChild(nameEl);
       meta.appendChild(p95row);
 
+      var btnGroup = document.createElement('div');
+      btnGroup.style.display = 'flex';
+      btnGroup.style.alignItems = 'center';
+
       var btn = document.createElement('button');
       btn.className = 'p95-btn';
       btn.textContent = 'Show p95 overlay';
@@ -703,8 +791,17 @@ function getDashboardHTML(): string {
         btn.addEventListener('click', function() { toggleP95(btn, name); });
       })(t.name);
 
+      var exclBtn = document.createElement('button');
+      exclBtn.className = 'excl-btn' + (isExcluded ? ' excluded' : '');
+      exclBtn.textContent = isExcluded ? 'Excluded' : 'Exclude';
+      (function(name) {
+        exclBtn.addEventListener('click', function() { toggleExclusion(name); });
+      })(t.name);
+
+      btnGroup.appendChild(btn);
+      btnGroup.appendChild(exclBtn);
       header.appendChild(meta);
-      header.appendChild(btn);
+      header.appendChild(btnGroup);
 
       // Chart area
       var wrap = document.createElement('div');
@@ -823,7 +920,8 @@ function getDashboardHTML(): string {
     async function init() {
       var range = document.getElementById('range').value;
 
-      // Reset state
+      // Reset state — preserve exclusions across range changes
+      loadExclusions();
       metricsCache = {};
       allTunnels   = [];
       filteredList = [];
@@ -837,19 +935,21 @@ function getDashboardHTML(): string {
       document.getElementById('search').value = '';
 
       try {
-        var responses = await Promise.all([
-          fetch('/api/summary?range=' + range),
+        var excl       = Object.keys(excludedTunnels);
+        var exclSuffix = excl.length ? '&exclude=' + excl.map(encodeURIComponent).join(',') : '';
+        var responses  = await Promise.all([
+          fetch('/api/summary?range=' + range + exclSuffix),
           fetch('/api/tunnels?range='  + range)
         ]);
 
         var summary     = await responses[0].json();
         var tunnelsData = await responses[1].json();
 
-        document.getElementById('p95-ingress').textContent  = formatBps(summary.p95_ingress_bps);
-        document.getElementById('p95-egress').textContent   = formatBps(summary.p95_egress_bps);
-        document.getElementById('tunnel-count').textContent = (tunnelsData.total || 0).toString();
+        document.getElementById('p95-ingress').textContent = formatBps(summary.p95_ingress_bps);
+        document.getElementById('p95-egress').textContent  = formatBps(summary.p95_egress_bps);
 
         allTunnels = tunnelsData.tunnels || [];
+        updateExclCount();
 
         if (allTunnels.length === 0) {
           document.getElementById('charts').innerHTML =
