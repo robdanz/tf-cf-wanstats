@@ -1,23 +1,24 @@
 # tf-cf-wanstats
 
-Cloudflare WAN utilization analytics dashboard. A single Cloudflare Worker polls the Cloudflare GraphQL Analytics API every 5 minutes, stores per-tunnel ingress and egress bit rates in D1, and serves a dashboard with per-tunnel time-series charts and an aggregate p95 summary view.
+Cloudflare WAN utilization analytics dashboard. A single Cloudflare Worker polls the Cloudflare GraphQL Analytics API every hour, stores per-tunnel ingress and egress bit rates in D1, and serves a dashboard with per-tunnel time-series charts and an aggregate p95 summary view.
 
 ## Architecture
 
 ```
-Cron (*/5 * * * *)
-  └─▶ Cloudflare GraphQL API (magicTransitTunnelTrafficAdaptiveGroups)
-        ingress + egress per tunnel
+Cron (0 * * * * — every hour)
+  └─▶ Cloudflare GraphQL API (magicTransitNetworkAnalyticsAdaptiveGroups)
+        single request, ingress + egress aliases, 65-min window
   └─▶ D1 (INSERT OR REPLACE, deduplicated by tunnel/direction/timestamp)
 
 HTTP (workers.dev)
-  GET /          → Dashboard HTML (Chart.js, inline)
-  GET /api/tunnels   → Distinct tunnel names
-  GET /api/metrics   → Time series + per-tunnel p95 for one tunnel
-  GET /api/summary   → Aggregate p95 ingress and egress (all tunnels summed)
+  GET /                               → Dashboard HTML (Chart.js, inline)
+  GET /api/tunnels?range=             → All tunnels with per-tunnel p95
+  GET /api/summary?range=&exclude=    → Aggregate p95 (excluded tunnels omitted)
+  GET /api/metrics?tunnel=&range=     → Time series + per-tunnel p95 for one tunnel
+  POST /api/backfill?start=&end=      → Upsert one time window (requires X-Backfill-Token header)
 ```
 
-The aggregate p95 mirrors Cloudflare's billing methodology: sum all tunnel traffic at each 5-minute interval, then take the p95 of those sums.
+The aggregate p95 mirrors Cloudflare's billing methodology: sum all non-excluded tunnel traffic at each 5-minute interval, then take the p95 of those sums.
 
 ## Prerequisites
 
@@ -25,9 +26,10 @@ The aggregate p95 mirrors Cloudflare's billing methodology: sum all tunnel traff
 - [Terraform](https://developer.hashicorp.com/terraform/install) ≥ 1.5
 - Cloudflare account with Cloudflare WAN (Magic WAN) configured and tunnels active
 
-## API Tokens Required
+## API Tokens and Secrets Required
 
-You need **two Cloudflare API tokens**. Create both at:
+You need **two Cloudflare API tokens** and **one generated secret**:
+
 **Cloudflare dashboard → Profile → API Tokens → Create Token → Custom Token**
 
 ### 1. Terraform deploy token (`cloudflare_api_token` in tfvars)
@@ -47,6 +49,16 @@ Used by the worker **at runtime** to query the GraphQL Analytics API. Stored as 
 | Permission | Level |
 |-----------|-------|
 | Account Analytics | Read |
+
+### 3. Backfill token (`backfill_token` in tfvars)
+
+Arbitrary secret that authenticates `POST /api/backfill` requests. Generate with:
+
+```bash
+openssl rand -hex 32
+```
+
+Stored as a Worker secret (`BACKFILL_TOKEN`).
 
 ## Setup
 
@@ -72,13 +84,14 @@ Fix any TypeScript errors before deploying. This is a no-output build step — i
 cp ../terraform/terraform.tfvars.example ../terraform/terraform.tfvars
 ```
 
-Edit `terraform/terraform.tfvars` and fill in all four values:
+Edit `terraform/terraform.tfvars` and fill in all five values:
 
 ```hcl
 cloudflare_account_id = "your-account-id"   # Workers & Pages → Overview → right sidebar
 workers_subdomain     = "your-subdomain"     # Workers & Pages → Overview → "Your subdomain" in right sidebar
 cloudflare_api_token  = "..."                # Terraform deploy token (see above)
 wan_api_token         = "..."                # WAN analytics token (see above)
+backfill_token        = "..."                # openssl rand -hex 32
 ```
 
 ### 4. Deploy with Terraform
@@ -94,17 +107,17 @@ Terraform runs the full deployment in order:
 1. Create the D1 database `tf-cf-wanstats-metrics`
 2. Render `worker/wrangler.jsonc` from the template (fills in account ID and D1 database ID)
 3. Apply the D1 schema migration (`migrations/0001_initial.sql`)
-4. Run `npm install && wrangler deploy` in the `worker/` directory to bundle and deploy the worker
-5. Set the `WAN_API_TOKEN` Worker secret via `wrangler secret put`
+4. Run `npm install && wrangler deploy` to bundle and deploy the worker
+5. Set `WAN_API_TOKEN` and `BACKFILL_TOKEN` Worker secrets via `wrangler secret put`
 
 The workers.dev URL is printed as `workers_dev_url` when apply completes.
 
-### 4. Verify
+### 5. Verify
 
 After `terraform apply` completes:
 
 - **Dashboard**: Open the URL printed by the `workers_dev_url` output.
-- **Cron**: The worker polls every 5 minutes. Check the D1 data after the first interval:
+- **Cron**: The worker polls every hour. Check D1 data after the first run:
   ```bash
   cd worker
   npx wrangler d1 execute tf-cf-wanstats-metrics --remote \
@@ -112,29 +125,49 @@ After `terraform apply` completes:
   ```
 - **Logs**: `cd worker && npm run tail`
 
+### 6. Backfill historical data (optional)
+
+```bash
+export WORKER_URL=https://tf-cf-wanstats.<your-subdomain>.workers.dev
+export BACKFILL_TOKEN=<value from terraform.tfvars>
+./scripts/backfill.sh 2026-06-01T00:00:00Z 2026-06-05T00:00:00Z
+```
+
+The script iterates hour-by-hour over the specified range, printing progress as it goes. Safe to re-run — duplicate rows are silently ignored.
+
 ## Local development
 
 ```bash
 cp .dev.vars.example .dev.vars
-# Fill in WAN_API_TOKEN and ACCOUNT_ID in .dev.vars
+# Fill in WAN_API_TOKEN, ACCOUNT_ID, and BACKFILL_TOKEN in .dev.vars
 
 cd worker
 npm run dev   # starts wrangler dev on http://localhost:8787
 ```
 
-Note: The cron trigger is not automatically fired during `wrangler dev`. To test the cron handler locally, use:
+To test the cron handler locally:
+```bash
+curl "http://localhost:8787/__scheduled?cron=0+*+*+*+*"
 ```
-curl "http://localhost:8787/__scheduled?cron=*%2F5+*+*+*+*"
-```
+
+## Dashboard features
+
+- **Per-tunnel p95 badges** on each card (ingress and egress)
+- **Aggregate p95 summary** across all included tunnels (mirrors Cloudflare billing)
+- **Exclude/Include toggle** on each tunnel card — WARP devices and other tunnels to omit can be excluded; exclusions persist in localStorage and are reflected in the aggregate p95 immediately
+- **Time range selector**: 24h (rolling), 7d (last 7 complete calendar days), 30d (last 30 complete calendar days)
+- **Search and sort** by tunnel name or p95 value
+- **Paginated** at 20 tunnels per page
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
 | `cd worker && npm run dev` | Local dev server (port 8787) |
-| `cd terraform && terraform apply` | Deploy everything (DB, worker, secret) |
+| `cd terraform && terraform apply` | Deploy everything (DB, worker, secrets) |
 | `cd worker && npm run tail` | Stream live Worker logs |
 | `cd worker && npm run typecheck` | TypeScript type check |
+| `./scripts/backfill.sh <start> <end>` | Backfill a historical date range |
 
 ## Protecting with Cloudflare Access
 
@@ -153,7 +186,7 @@ cd worker && npm run typecheck   # verify before deploying
 cd ../terraform && terraform apply
 ```
 
-Terraform detects changes via `filesha256` on `worker/src/index.ts` and re-runs `wrangler deploy` automatically. No manual wrangler commands needed.
+Terraform detects changes via `filesha256` on `worker/src/index.ts` and re-runs `wrangler deploy` automatically.
 
 ## Data retention
 
@@ -162,10 +195,7 @@ D1 rows accumulate indefinitely. Consider adding a periodic cleanup after you ha
 DELETE FROM tunnel_metrics WHERE ts < datetime('now', '-90 days');
 ```
 
-This can be added as a second cron trigger on the worker or run manually.
-
 ## Notes
 
-- **GraphQL `limit: 100`**: The query fetches at most 100 tunnel+direction combinations per poll. If you have more than 50 tunnels (since ingress and egress are separate rows), add pagination logic to `fetchTunnelMetrics` in `worker/src/index.ts`.
 - **`wrangler.jsonc` is generated** by Terraform from `wrangler.jsonc.tpl`. Do not edit `wrangler.jsonc` directly — it is gitignored and will be overwritten on `terraform apply`.
 - **`AI-SETUP-INSTRUCTIONS.md`** is local only and gitignored.
