@@ -93,6 +93,10 @@ while [[ "$current" -lt "$end_epoch" ]]; do
     total_ingress=$((total_ingress + in_rows))
     total_egress=$((total_egress + eg_rows))
     windows=$((windows + 1))
+    # Show any data collection warnings (e.g., GraphQL limit reached)
+    if echo "$response" | grep -q '"warnings":\[\"'; then
+      echo "    WARNINGS in response" >&2
+    fi
   else
     echo "ERROR"
     echo "    Response: $response" >&2
