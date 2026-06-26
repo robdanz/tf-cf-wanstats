@@ -8,11 +8,15 @@
     "deploy:staging": "wrangler deploy --env staging",
     "deploy:production": "wrangler deploy --env production",
     "tail": "wrangler tail",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.16.20",
     "@cloudflare/workers-types": "^4.20240208.0",
     "typescript": "^5.4.0",
+    "vitest": "^4.1.9",
     "wrangler": "^3.50.0"
   }
 }
