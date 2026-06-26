@@ -96,7 +96,18 @@ resource "null_resource" "deploy" {
   depends_on = [null_resource.migrate, null_resource.migrate_0002]
 
   triggers = {
-    worker_hash   = filesha256("${path.module}/../worker/src/index.ts")
+    # Hash all source files so any change triggers redeploy
+    worker_hash = sha256(join(",", [
+      filesha256("${path.module}/../worker/src/index.ts"),
+      filesha256("${path.module}/../worker/src/types.ts"),
+      filesha256("${path.module}/../worker/src/graphql.ts"),
+      filesha256("${path.module}/../worker/src/d1.ts"),
+      filesha256("${path.module}/../worker/src/r2.ts"),
+      filesha256("${path.module}/../worker/src/cron.ts"),
+      filesha256("${path.module}/../worker/src/api.ts"),
+      filesha256("${path.module}/../worker/src/dashboard.ts"),
+      filesha256("${path.module}/../worker/src/utils.ts"),
+    ]))
     wrangler_hash = sha256(local_file.wrangler_jsonc.content)
   }
 
