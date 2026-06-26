@@ -1,59 +1,5 @@
-interface Env {
-  DB: D1Database;
-  WAN_API_TOKEN: string;    // Cloudflare API token — Account Analytics: Read
-  ACCOUNT_ID: string;       // Cloudflare account ID (non-secret var)
-  BACKFILL_TOKEN: string;   // Secret for authenticating POST /api/backfill
-}
-
-// magicTransitNetworkAnalyticsAdaptiveGroups returns separate tunnel name fields
-// per direction — ingressTunnelName and egressTunnelName — rather than a unified
-// tunnelName + direction pair. Accept both datetime field spellings defensively.
-interface IngressDimensions {
-  ingressTunnelName: string;
-  datetimeFiveMinutes?: string;
-  datetimeFiveMinute?: string;
-}
-
-interface EgressDimensions {
-  egressTunnelName: string;
-  datetimeFiveMinutes?: string;
-  datetimeFiveMinute?: string;
-}
-
-interface IngressRow {
-  avg: { bitRateFiveMinutes: number };
-  dimensions: IngressDimensions;
-}
-
-interface EgressRow {
-  avg: { bitRateFiveMinutes: number };
-  dimensions: EgressDimensions;
-}
-
-interface GraphQLResponse {
-  data?: {
-    viewer: {
-      accounts: Array<{
-        ingress: IngressRow[];
-        egress: EgressRow[];
-      }>;
-    };
-  };
-  errors?: Array<{ message: string }>;
-}
-
-// ── Token verification ────────────────────────────────────────────────────────
-// Timing-safe comparison via SHA-256 digest XOR reduction — prevents token
-// length/content leakage through response timing.
-
-async function verifyToken(provided: string, expected: string): Promise<boolean> {
-  const enc = new TextEncoder();
-  const a = new Uint8Array(await crypto.subtle.digest('SHA-256', enc.encode(provided)));
-  const b = new Uint8Array(await crypto.subtle.digest('SHA-256', enc.encode(expected)));
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
-  return diff === 0;
-}
+import type { Env, IngressRow, EgressRow, GraphQLResponse, NormalizedRow, TunnelStat } from './types';
+import { verifyToken, rangeToSince } from './utils';
 
 // ── GraphQL query ─────────────────────────────────────────────────────────────
 // Uses magicTransitNetworkAnalyticsAdaptiveGroups, which correctly populates
@@ -165,8 +111,6 @@ async function storeTunnelMetrics(
 // ── Normalization ─────────────────────────────────────────────────────────────
 // Converts raw API rows into the flat shape expected by storeTunnelMetrics.
 
-type NormalizedRow = { tunnelName: string; ts: string; bitRate: number };
-
 function normalizeMetrics(
   ingressRows: IngressRow[],
   egressRows: EgressRow[],
@@ -266,23 +210,6 @@ async function handleBackfill(request: Request, env: Env): Promise<Response> {
   });
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-// 24h: rolling window from now — shows today's live data.
-// 7d / 30d: aligned to UTC midnight boundaries so results represent complete
-// calendar days. E.g. "7d" = midnight 7 days ago through end of yesterday,
-// not a rolling 168-hour window.
-function rangeToSince(range: string): string {
-  if (range === '7d' || range === '30d') {
-    const days = range === '7d' ? 7 : 30;
-    const d = new Date();
-    d.setUTCHours(0, 0, 0, 0);         // snap to start of today (UTC)
-    d.setUTCDate(d.getUTCDate() - days); // back N days
-    return d.toISOString();
-  }
-  return new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-}
-
 // ── SQL constants ─────────────────────────────────────────────────────────────
 
 // Per-tunnel p95 for a single direction and time range.
@@ -342,12 +269,6 @@ const P95_ALL_TUNNELS_SQL = `
 `;
 
 // ── HTTP API handlers ─────────────────────────────────────────────────────────
-
-interface TunnelStat {
-  tunnel_name: string;
-  p95_ingress_bps: number | null;
-  p95_egress_bps: number | null;
-}
 
 async function handleApiRequest(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
