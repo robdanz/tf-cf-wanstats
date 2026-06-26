@@ -33,6 +33,17 @@ resource "cloudflare_d1_database" "metrics" {
   }
 }
 
+# ── R2 Bucket ─────────────────────────────────────────────────────────────────
+
+resource "cloudflare_r2_bucket" "raw_metrics" {
+  account_id = var.cloudflare_account_id
+  name       = "tf-cf-wanstats-raw-metrics"
+
+  lifecycle {
+    ignore_changes = all
+  }
+}
+
 # ── Render wrangler.jsonc from template ────────────────────────────────────────
 
 resource "local_file" "wrangler_jsonc" {
@@ -62,10 +73,27 @@ resource "null_resource" "migrate" {
   }
 }
 
+resource "null_resource" "migrate_0002" {
+  depends_on = [null_resource.migrate, local_file.wrangler_jsonc]
+
+  triggers = {
+    migration_hash = filesha256("${path.module}/../migrations/0002_rollups.sql")
+    database_id    = cloudflare_d1_database.metrics.id
+  }
+
+  provisioner "local-exec" {
+    working_dir = "${path.module}/../worker"
+    command     = "npx wrangler d1 execute tf-cf-wanstats-metrics --remote --file=${abspath(path.module)}/../migrations/0002_rollups.sql"
+    environment = {
+      CLOUDFLARE_API_TOKEN = var.cloudflare_api_token
+    }
+  }
+}
+
 # ── Deploy Worker ──────────────────────────────────────────────────────────────
 
 resource "null_resource" "deploy" {
-  depends_on = [null_resource.migrate]
+  depends_on = [null_resource.migrate, null_resource.migrate_0002]
 
   triggers = {
     worker_hash   = filesha256("${path.module}/../worker/src/index.ts")

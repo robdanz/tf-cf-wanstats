@@ -16,6 +16,12 @@
       "database_id": "${d1_database_id}"
     }
   ],
+  "r2_buckets": [
+    {
+      "binding": "RAW_METRICS",
+      "bucket_name": "tf-cf-wanstats-raw-metrics"
+    }
+  ],
   "vars": {
     "ACCOUNT_ID": "${account_id}"
   }
