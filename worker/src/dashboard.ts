@@ -675,7 +675,7 @@ export function getDashboardHTML(): string {
         .then(function(blob) {
           var a = document.createElement('a');
           a.href = URL.createObjectURL(blob);
-          a.download = 'wanstats-export.csv';
+          a.download = 'wanstats-export.csv.gz';
           document.body.appendChild(a);
           a.click();
           document.body.removeChild(a);

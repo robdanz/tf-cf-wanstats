@@ -229,15 +229,16 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
     }
 
     const tunnel = url.searchParams.get('tunnel') ?? null;
-    const stream = await streamCsvExport(env.RAW_METRICS, startDate, endDate, tunnel);
+    const csvStream = await streamCsvExport(env.RAW_METRICS, startDate, endDate, tunnel);
+    const gzipStream = csvStream.pipeThrough(new CompressionStream('gzip'));
 
     const filename = tunnel
-      ? `wanstats-${tunnel}-${start.slice(0, 10)}-to-${end.slice(0, 10)}.csv`
-      : `wanstats-all-${start.slice(0, 10)}-to-${end.slice(0, 10)}.csv`;
+      ? `wanstats-${tunnel}-${start.slice(0, 10)}-to-${end.slice(0, 10)}.csv.gz`
+      : `wanstats-all-${start.slice(0, 10)}-to-${end.slice(0, 10)}.csv.gz`;
 
-    return new Response(stream, {
+    return new Response(gzipStream, {
       headers: {
-        'Content-Type': 'text/csv; charset=utf-8',
+        'Content-Type': 'application/gzip',
         'Content-Disposition': `attachment; filename="${filename}"`,
       },
     });
