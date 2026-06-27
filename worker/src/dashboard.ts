@@ -541,8 +541,8 @@ export function getDashboardHTML(): string {
       for (i = 0; i < egress.length; i++) egressMap[egress[i].ts] = egress[i].bps;
 
       var labels = allTs.map(function(ts) { return formatLabel(ts); });
-      var ingressArr = allTs.map(function(ts) { return ingressMap[ts] !== undefined ? ingressMap[ts] / 1e6 : null; });
-      var egressArr = allTs.map(function(ts) { return egressMap[ts] !== undefined ? egressMap[ts] / 1e6 : null; });
+      var ingressArr = allTs.map(function(ts) { return ingressMap[ts] !== undefined ? ingressMap[ts] / 1e6 : 0; });
+      var egressArr = allTs.map(function(ts) { return egressMap[ts] !== undefined ? egressMap[ts] / 1e6 : 0; });
 
       var p95In = metrics.p95_ingress_bps !== null ? metrics.p95_ingress_bps / 1e6 : null;
       var p95Eg = metrics.p95_egress_bps !== null ? metrics.p95_egress_bps / 1e6 : null;
