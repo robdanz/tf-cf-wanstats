@@ -213,8 +213,91 @@ Terraform detects changes via `filesha256` on files under `worker/src/` and re-r
 
 Retention is enforced automatically by the daily midnight UTC cron run.
 
+## Statistical design: p95 calculation and data tiering
+
+### How Cloudflare bills Magic WAN
+
+Cloudflare computes utilization from **5-minute average bit rate samples**. Each sample is the average bits-per-second observed across a 5-minute window. Billing uses the **95th percentile (p95)** of these samples over a calendar month.
+
+A 30-day month has `30 × 24 × 12 = 8,640` five-minute intervals. P95 means: sort all 8,640 values, discard the top 5% (the 432 highest), and your bill is based on the next value down. This allows for short traffic bursts without them dominating the bill.
+
+### How this tool computes p95
+
+D1/SQLite has no built-in `PERCENTILE()` function. We compute p95 using SQL window functions:
+
+```sql
+WITH ranked AS (
+  SELECT bit_rate AS val,
+         ROW_NUMBER() OVER (ORDER BY bit_rate) AS rn,
+         COUNT(*) OVER () AS n
+  FROM tunnel_metrics
+  WHERE tunnel_name = ? AND direction = ? AND ts >= ?
+)
+SELECT val FROM ranked
+WHERE rn = CAST(CEIL(0.95 * n) AS INTEGER)
+LIMIT 1
+```
+
+This sorts all samples, then picks the value at position `⌈0.95 × n⌉`. For 8,640 samples, that's position 8,208 — exactly the 95th percentile.
+
+**Aggregate p95** (across all tunnels) first sums all tunnel bit rates per 5-minute interval, then takes p95 of those per-interval sums. This mirrors Cloudflare's billing methodology: the bill is based on total bandwidth across all tunnels, not individual tunnel peaks.
+
+### Why dashboard p95 and billing p95 are different numbers
+
+The dashboard supports time ranges from 24 hours to 180 days. Keeping 180 days of raw 5-minute data in D1 for 2,000 tunnels would mean ~93 million rows — too many for D1 window functions to process within query time limits. So we use **pre-aggregated rollup tables** for longer ranges:
+
+| Dashboard range | Data source | Granularity | p95 accuracy |
+|----------------|-------------|-------------|-------------|
+| 24 hours | `tunnel_metrics` | 5-minute samples | **Exact** — same raw data Cloudflare uses |
+| 7 or 30 days | `tunnel_metrics_hourly` | Hourly averages | **Estimate** — see below |
+| 90 or 180 days | `tunnel_metrics_daily` | Daily averages | **Rough estimate** — see below |
+| Billing section | R2 raw CSVs | 5-minute samples | **Exact** — computed from raw archive |
+
+**Why rollup-based p95 is an estimate, not exact:**
+
+Averaging smooths out peaks. An hour with 12 five-minute samples (e.g., `[10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 80]`) has an average of `17.5` but a peak of `80`. When you take p95 of hourly averages, you're taking p95 of already-smoothed values — the spikes that p95 is designed to capture get hidden inside the averages.
+
+**Concrete example:** Imagine a tunnel that's idle (1 Kbps) for 23 hours and 42 minutes per day, but bursts to 100 Mbps for 18 minutes (three 5-minute intervals with traffic, plus one partial). Over 30 days:
+- **True p95 from raw 5-min data:** ~1 Kbps (the burst only accounts for 90 out of 8,640 intervals = ~1%, well within the 5% headroom)
+- **P95 from hourly averages:** ~1 Kbps (burst is averaged into one hour at ~12.4 Mbps; but that's only 30 out of 720 hours = ~4.2%, still within the 5% discard range — so the result is similar in this case)
+
+But change the pattern slightly — bursts scattered across many hours — and the rollup-based estimate diverges more from the true value. The general rule:
+
+- **p95 of averages ≤ true p95** (averaging suppresses peaks — always understates)
+- **p95 of maximums ≥ true p95** (picking the worst sample per period — always overstates)
+- **p95 of p95s ≥ true p95** (taking p95 of already-elevated values — also overstates, and is not a valid statistical composition)
+
+There is no algebraically correct way to compute the true p95 from pre-aggregated sub-period statistics. The only valid approach is to go back to the raw samples. This is why we archive raw 5-minute data in R2 for 6 months and compute billing p95 from that archive.
+
+### Why we considered and rejected adding p95 to rollup tables
+
+We evaluated storing a pre-computed p95 column alongside the average in rollup tables. For hourly rollups with 12 samples, `⌈0.95 × 12⌉ = 12` — the p95 equals the maximum, which is already stored as `max_bit_rate`. No additional value.
+
+For daily rollups (288 samples), the p95 would be a meaningful value within that day. But composing a 30-day p95 from daily p95 values (taking the p95 of p95s) **overstates** the true value — you're selecting the 95th percentile of already-elevated values, biasing upward. This is the opposite error from p95-of-averages (which understates), but equally wrong.
+
+Since neither composition is correct, and we already have the exact answer available from R2 raw data, adding a p95 column to rollups would introduce a third wrong number without improving accuracy. We chose not to add it.
+
+### Tiered storage rationale
+
+| Store | What | Why | Retention |
+|-------|------|-----|-----------|
+| D1 `tunnel_metrics` | Raw 5-min samples | Fast indexed queries for 24h dashboard | 7 days |
+| D1 `tunnel_metrics_hourly` | Hourly avg/max/min | Fast queries for 7d/30d dashboard | 60 days |
+| D1 `tunnel_metrics_daily` | Daily avg/max/min | Fast queries for 90d/180d dashboard | 180 days |
+| R2 raw CSVs | Raw 5-min samples | Billing p95 computation, CSV export, audit trail | 6 months |
+
+D1 and R2 overlap for the most recent 7 days (both hold raw data). This is intentional — D1 serves fast indexed SQL queries for the dashboard, while R2 provides the durable archive for billing validation and export. The dual-write cost is negligible.
+
+### GraphQL data collection at scale
+
+The Cloudflare GraphQL Analytics API returns one row per tunnel per 5-minute interval per direction. With 2,000 tunnels and a 65-minute fetch window (13 intervals), a single request would need `2,000 × 13 = 26,000` rows per direction — far exceeding the API's row limit.
+
+We solve this with **time-sliced fetching**: one API call per 5-minute bucket, with `limit: 3000` per direction per call. At 2,000 tunnels, each call returns ~2,000 rows (well under 3,000). The 65-minute window requires 13 sequential API calls — trivial for an hourly cron job.
+
+A capacity warning is logged when any single slice returns 2,500+ rows, signaling that the limit should be raised before data truncation occurs.
+
 ## Notes
 
 - **`wrangler.jsonc` is generated** by Terraform from `wrangler.jsonc.tpl`. Do not edit `wrangler.jsonc` directly — it is gitignored and will be overwritten on `terraform apply`.
 - **`AI-SETUP-INSTRUCTIONS.md`** is local only and gitignored.
-- **Chart p95 values for rollup-based ranges** (7d, 30d, 90d, 180d) are estimates computed from pre-aggregated data. Billing p95 values always use raw 5-min R2 data for accuracy and are labeled separately in the dashboard.
+- **Chart p95 values for rollup-based ranges** (7d, 30d, 90d, 180d) are labeled as estimates in the dashboard with a persistent amber banner. Billing p95 values always use raw 5-min R2 data and are shown in a separate section.
