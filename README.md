@@ -303,5 +303,4 @@ A capacity warning is logged when any single slice returns 2,500+ rows, signalin
 ## Notes
 
 - **`wrangler.jsonc` is generated** by Terraform from `wrangler.jsonc.tpl`. Do not edit `wrangler.jsonc` directly — it is gitignored and will be overwritten on `terraform apply`.
-- **`AI-SETUP-INSTRUCTIONS.md`** is local only and gitignored.
 - **Chart p95 values for rollup-based ranges** (7d, 30d, 90d, 180d) are labeled as estimates in the dashboard with a persistent amber banner. Billing p95 values always use raw 5-min R2 data and are shown in a separate section.
