@@ -1,5 +1,9 @@
 # tf-cf-wanstats
 
+> **Disclaimer:** This is not an official Cloudflare product or repository. It is an independent, community-built tool provided as-is, with no warranty of any kind, express or implied. By using this software you acknowledge that it is not supported, endorsed, or maintained by Cloudflare, Inc. Use at your own risk.
+>
+> This tool provisions and consumes Cloudflare services (Workers, D1, R2, and the GraphQL Analytics API) that may incur charges on your Cloudflare account. You are solely responsible for any costs incurred. Consult with your Cloudflare account team to understand the billing implications before deploying.
+
 Cloudflare WAN utilization analytics dashboard. A single Cloudflare Worker polls the Cloudflare GraphQL Analytics API every hour, stores per-tunnel ingress and egress bit rates in D1, archives raw data to R2, and serves a dashboard with per-tunnel time-series charts, an aggregate p95 summary view, and billing-grade p95 reporting.
 
 ## Architecture
