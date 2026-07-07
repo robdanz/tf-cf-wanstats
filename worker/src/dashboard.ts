@@ -6,6 +6,7 @@ export function getDashboardHTML(): string {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Cloudflare WAN Analytics</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3"></script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: system-ui, -apple-system, sans-serif; background: #f3f4f6; color: #111827; }
@@ -429,6 +430,14 @@ export function getDashboardHTML(): string {
       var names = Object.keys(canvasMap);
       if (names.length === 0) return;
 
+      var range = document.getElementById('range').value;
+      var chartEnd;
+      if (range === 'custom' && customEnd) {
+        chartEnd = new Date(customEnd);
+      } else {
+        chartEnd = new Date();
+      }
+
       var batchUrl = '/api/metrics?tunnels=' + names.map(encodeURIComponent).join(',') + '&' + rangeParams;
 
       fetch(batchUrl)
@@ -437,7 +446,7 @@ export function getDashboardHTML(): string {
           var tunnelMetrics = data.tunnels || {};
           names.forEach(function(name) {
             if (tunnelMetrics[name] && canvasMap[name]) {
-              populateChart(name, canvasMap[name], tunnelMetrics[name]);
+              populateChart(name, canvasMap[name], tunnelMetrics[name], chartEnd);
             }
           });
         })
@@ -518,7 +527,7 @@ export function getDashboardHTML(): string {
       return canvas;
     }
 
-    function populateChart(tunnelName, canvas, metrics) {
+    function populateChart(tunnelName, canvas, metrics, chartEnd) {
       if (!canvas.parentNode) return;
 
       var loading = canvas.parentNode.querySelector('.chart-loading');
@@ -540,7 +549,7 @@ export function getDashboardHTML(): string {
       for (i = 0; i < ingress.length; i++) ingressMap[ingress[i].ts] = ingress[i].bps;
       for (i = 0; i < egress.length; i++) egressMap[egress[i].ts] = egress[i].bps;
 
-      var labels = allTs.map(function(ts) { return formatLabel(ts); });
+      var labels = allTs.map(function(ts) { return new Date(ts); });
       var ingressArr = allTs.map(function(ts) { return ingressMap[ts] !== undefined ? ingressMap[ts] / 1e6 : 0; });
       var egressArr = allTs.map(function(ts) { return egressMap[ts] !== undefined ? egressMap[ts] / 1e6 : 0; });
 
@@ -597,7 +606,12 @@ export function getDashboardHTML(): string {
           },
           scales: {
             y: { title: { display: true, text: 'Mbps' }, beginAtZero: true },
-            x: { ticks: { maxTicksLimit: 10, maxRotation: 0 } }
+            x: {
+              type: 'time',
+              max: chartEnd,
+              time: { tooltipFormat: 'MMM d, h:mm a' },
+              ticks: { maxTicksLimit: 10, maxRotation: 0 }
+            }
           }
         }
       });
