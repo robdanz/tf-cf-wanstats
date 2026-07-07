@@ -1,5 +1,5 @@
 import type { Env, TunnelStat } from './types';
-import { verifyToken, rangeToSince, rangeToTable } from './utils';
+import { verifyToken, rangeToSince, rangeToUntil, rangeToTable, tableToStepSeconds, snapToStep } from './utils';
 import {
   buildPaginatedTunnelsSql,
   buildTunnelCountSql,
@@ -35,10 +35,12 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
     const range = url.searchParams.get('range') ?? '24h';
     const customStart = url.searchParams.get('start') ?? undefined;
     const customEnd = url.searchParams.get('end') ?? undefined;
-    const since = rangeToSince(range, customStart, customEnd);
     const table = rangeToTable(range, customStart && customEnd
       ? Math.ceil((new Date(customEnd).getTime() - new Date(customStart).getTime()) / 86400000)
       : undefined);
+    const stepSeconds = tableToStepSeconds(table);
+    const since = snapToStep(rangeToSince(range, customStart, customEnd), stepSeconds);
+    const until = rangeToUntil(range, customStart, customEnd);
 
     const page = Math.max(1, parseInt(url.searchParams.get('page') ?? '1', 10));
     const pageSize = Math.min(100, Math.max(1, parseInt(url.searchParams.get('pageSize') ?? '20', 10)));
@@ -61,11 +63,12 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
     const countResult = await countBound.first<{ total: number }>();
     const total = countResult?.total ?? 0;
 
+    // Bind: ?1=since, ?2=pageSize, ?3=offset, ?4=until, ?5=step_seconds, ?6=searchPattern (if hasSearch)
     const sql = buildPaginatedTunnelsSql(table, sortColumn, sortDir, hasSearch);
     const stmt = env.DB.prepare(sql);
     const bound = hasSearch
-      ? stmt.bind(since, pageSize, offset, searchPattern)
-      : stmt.bind(since, pageSize, offset);
+      ? stmt.bind(since, pageSize, offset, until, stepSeconds, searchPattern)
+      : stmt.bind(since, pageSize, offset, until, stepSeconds);
     const { results } = await bound.all<TunnelStat & { p95_max: number }>();
 
     const isEstimate = table !== 'raw';
@@ -89,19 +92,22 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
     const range = url.searchParams.get('range') ?? '24h';
     const customStart = url.searchParams.get('start') ?? undefined;
     const customEnd = url.searchParams.get('end') ?? undefined;
-    const since = rangeToSince(range, customStart, customEnd);
     const table = rangeToTable(range, customStart && customEnd
       ? Math.ceil((new Date(customEnd).getTime() - new Date(customStart).getTime()) / 86400000)
       : undefined);
+    const stepSeconds = tableToStepSeconds(table);
+    const since = snapToStep(rangeToSince(range, customStart, customEnd), stepSeconds);
+    const until = rangeToUntil(range, customStart, customEnd);
 
     const excludeParam = url.searchParams.get('exclude') ?? '';
     const excludeList = excludeParam ? excludeParam.split(',').map(decodeURIComponent) : [];
     const excludeJson = JSON.stringify(excludeList);
 
+    // Bind: ?1=direction, ?2=since, ?3=excludeJson, ?4=until, ?5=step_seconds
     const aggSql = getP95AggregateSql(table);
     const [p95In, p95Eg] = await Promise.all([
-      env.DB.prepare(aggSql).bind('ingress', since, excludeJson).first<{ val: number }>(),
-      env.DB.prepare(aggSql).bind('egress', since, excludeJson).first<{ val: number }>(),
+      env.DB.prepare(aggSql).bind('ingress', since, excludeJson, until, stepSeconds).first<{ val: number }>(),
+      env.DB.prepare(aggSql).bind('egress', since, excludeJson, until, stepSeconds).first<{ val: number }>(),
     ]);
 
     const isEstimate = table !== 'raw';
@@ -122,12 +128,15 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
     const range = url.searchParams.get('range') ?? '24h';
     const customStart = url.searchParams.get('start') ?? undefined;
     const customEnd = url.searchParams.get('end') ?? undefined;
-    const since = rangeToSince(range, customStart, customEnd);
     const table = rangeToTable(range, customStart && customEnd
       ? Math.ceil((new Date(customEnd).getTime() - new Date(customStart).getTime()) / 86400000)
       : undefined);
+    const stepSeconds = tableToStepSeconds(table);
+    const since = snapToStep(rangeToSince(range, customStart, customEnd), stepSeconds);
+    const until = rangeToUntil(range, customStart, customEnd);
 
     const tsSql = buildTimeSeriesSql(table);
+    // Bind: ?1=tunnel_name, ?2=direction, ?3=since, ?4=until, ?5=step_seconds
     const p95Sql = getP95PerTunnelSql(table);
     const isEstimate = table !== 'raw';
 
@@ -142,8 +151,8 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
       const [ingressTs, egressTs, p95In, p95Eg] = await Promise.all([
         env.DB.prepare(tsSql).bind(tunnel, 'ingress', since).all<{ ts: string; bit_rate: number }>(),
         env.DB.prepare(tsSql).bind(tunnel, 'egress', since).all<{ ts: string; bit_rate: number }>(),
-        env.DB.prepare(p95Sql).bind(tunnel, 'ingress', since).first<{ val: number }>(),
-        env.DB.prepare(p95Sql).bind(tunnel, 'egress', since).first<{ val: number }>(),
+        env.DB.prepare(p95Sql).bind(tunnel, 'ingress', since, until, stepSeconds).first<{ val: number }>(),
+        env.DB.prepare(p95Sql).bind(tunnel, 'egress', since, until, stepSeconds).first<{ val: number }>(),
       ]);
 
       results[tunnel] = {

@@ -78,49 +78,79 @@ export async function purgeOldData(db: D1Database): Promise<{
 }
 
 // ── SQL for per-tunnel p95 ──────────────────────────────────────────────────
+// Bind params: ?1=tunnel_name, ?2=direction, ?3=since, ?4=until, ?5=step_seconds
 
 export const P95_PER_TUNNEL_RAW_SQL = `
-  WITH ranked AS (
-    SELECT bit_rate AS val,
-           ROW_NUMBER() OVER (ORDER BY bit_rate) AS rn,
+  WITH RECURSIVE slots(ts) AS (
+    SELECT strftime('%Y-%m-%dT%H:%M:%SZ', ?3)
+    UNION ALL
+    SELECT strftime('%Y-%m-%dT%H:%M:%SZ', ts, '+' || ?5 || ' seconds') FROM slots
+    WHERE strftime('%Y-%m-%dT%H:%M:%SZ', ts, '+' || ?5 || ' seconds') < ?4
+  ),
+  ranked AS (
+    SELECT COALESCE(m.bit_rate, 0) AS val,
+           ROW_NUMBER() OVER (ORDER BY COALESCE(m.bit_rate, 0)) AS rn,
            COUNT(*) OVER () AS n
-    FROM tunnel_metrics
-    WHERE tunnel_name = ? AND direction = ? AND ts >= ?
+    FROM slots s
+    LEFT JOIN tunnel_metrics m
+      ON m.ts = s.ts AND m.tunnel_name = ?1 AND m.direction = ?2
   )
   SELECT val FROM ranked WHERE rn = CAST(CEIL(0.95 * n) AS INTEGER) LIMIT 1
 `;
 
 export const P95_PER_TUNNEL_HOURLY_SQL = `
-  WITH ranked AS (
-    SELECT avg_bit_rate AS val,
-           ROW_NUMBER() OVER (ORDER BY avg_bit_rate) AS rn,
+  WITH RECURSIVE slots(ts) AS (
+    SELECT strftime('%Y-%m-%dT%H:%M:%SZ', ?3)
+    UNION ALL
+    SELECT strftime('%Y-%m-%dT%H:%M:%SZ', ts, '+' || ?5 || ' seconds') FROM slots
+    WHERE strftime('%Y-%m-%dT%H:%M:%SZ', ts, '+' || ?5 || ' seconds') < ?4
+  ),
+  ranked AS (
+    SELECT COALESCE(m.avg_bit_rate, 0) AS val,
+           ROW_NUMBER() OVER (ORDER BY COALESCE(m.avg_bit_rate, 0)) AS rn,
            COUNT(*) OVER () AS n
-    FROM tunnel_metrics_hourly
-    WHERE tunnel_name = ? AND direction = ? AND ts >= ?
+    FROM slots s
+    LEFT JOIN tunnel_metrics_hourly m
+      ON strftime('%Y-%m-%dT%H:%M:%SZ', m.ts) = s.ts AND m.tunnel_name = ?1 AND m.direction = ?2
   )
   SELECT val FROM ranked WHERE rn = CAST(CEIL(0.95 * n) AS INTEGER) LIMIT 1
 `;
 
 export const P95_PER_TUNNEL_DAILY_SQL = `
-  WITH ranked AS (
-    SELECT avg_bit_rate AS val,
-           ROW_NUMBER() OVER (ORDER BY avg_bit_rate) AS rn,
+  WITH RECURSIVE slots(ts) AS (
+    SELECT strftime('%Y-%m-%dT%H:%M:%SZ', ?3)
+    UNION ALL
+    SELECT strftime('%Y-%m-%dT%H:%M:%SZ', ts, '+' || ?5 || ' seconds') FROM slots
+    WHERE strftime('%Y-%m-%dT%H:%M:%SZ', ts, '+' || ?5 || ' seconds') < ?4
+  ),
+  ranked AS (
+    SELECT COALESCE(m.avg_bit_rate, 0) AS val,
+           ROW_NUMBER() OVER (ORDER BY COALESCE(m.avg_bit_rate, 0)) AS rn,
            COUNT(*) OVER () AS n
-    FROM tunnel_metrics_daily
-    WHERE tunnel_name = ? AND direction = ? AND ts >= ?
+    FROM slots s
+    LEFT JOIN tunnel_metrics_daily m
+      ON strftime('%Y-%m-%dT%H:%M:%SZ', m.ts) = s.ts AND m.tunnel_name = ?1 AND m.direction = ?2
   )
   SELECT val FROM ranked WHERE rn = CAST(CEIL(0.95 * n) AS INTEGER) LIMIT 1
 `;
 
 // ── SQL for aggregate p95 ───────────────────────────────────────────────────
+// Bind params: ?1=direction, ?2=since, ?3=excludeJson, ?4=until, ?5=step_seconds
 
 export const P95_AGGREGATE_RAW_SQL = `
-  WITH totals AS (
-    SELECT ts, SUM(bit_rate) AS val
-    FROM tunnel_metrics
-    WHERE direction = ? AND ts >= ?
-      AND tunnel_name NOT IN (SELECT value FROM json_each(?))
-    GROUP BY ts
+  WITH RECURSIVE slots(ts) AS (
+    SELECT strftime('%Y-%m-%dT%H:%M:%SZ', ?2)
+    UNION ALL
+    SELECT strftime('%Y-%m-%dT%H:%M:%SZ', ts, '+' || ?5 || ' seconds') FROM slots
+    WHERE strftime('%Y-%m-%dT%H:%M:%SZ', ts, '+' || ?5 || ' seconds') < ?4
+  ),
+  totals AS (
+    SELECT s.ts, COALESCE(SUM(m.bit_rate), 0) AS val
+    FROM slots s
+    LEFT JOIN tunnel_metrics m
+      ON m.ts = s.ts AND m.direction = ?1
+      AND m.tunnel_name NOT IN (SELECT value FROM json_each(?3))
+    GROUP BY s.ts
   ),
   ranked AS (
     SELECT val,
@@ -132,12 +162,19 @@ export const P95_AGGREGATE_RAW_SQL = `
 `;
 
 export const P95_AGGREGATE_HOURLY_SQL = `
-  WITH totals AS (
-    SELECT ts, SUM(avg_bit_rate) AS val
-    FROM tunnel_metrics_hourly
-    WHERE direction = ? AND ts >= ?
-      AND tunnel_name NOT IN (SELECT value FROM json_each(?))
-    GROUP BY ts
+  WITH RECURSIVE slots(ts) AS (
+    SELECT strftime('%Y-%m-%dT%H:%M:%SZ', ?2)
+    UNION ALL
+    SELECT strftime('%Y-%m-%dT%H:%M:%SZ', ts, '+' || ?5 || ' seconds') FROM slots
+    WHERE strftime('%Y-%m-%dT%H:%M:%SZ', ts, '+' || ?5 || ' seconds') < ?4
+  ),
+  totals AS (
+    SELECT s.ts, COALESCE(SUM(m.avg_bit_rate), 0) AS val
+    FROM slots s
+    LEFT JOIN tunnel_metrics_hourly m
+      ON strftime('%Y-%m-%dT%H:%M:%SZ', m.ts) = s.ts AND m.direction = ?1
+      AND m.tunnel_name NOT IN (SELECT value FROM json_each(?3))
+    GROUP BY s.ts
   ),
   ranked AS (
     SELECT val,
@@ -149,12 +186,19 @@ export const P95_AGGREGATE_HOURLY_SQL = `
 `;
 
 export const P95_AGGREGATE_DAILY_SQL = `
-  WITH totals AS (
-    SELECT ts, SUM(avg_bit_rate) AS val
-    FROM tunnel_metrics_daily
-    WHERE direction = ? AND ts >= ?
-      AND tunnel_name NOT IN (SELECT value FROM json_each(?))
-    GROUP BY ts
+  WITH RECURSIVE slots(ts) AS (
+    SELECT strftime('%Y-%m-%dT%H:%M:%SZ', ?2)
+    UNION ALL
+    SELECT strftime('%Y-%m-%dT%H:%M:%SZ', ts, '+' || ?5 || ' seconds') FROM slots
+    WHERE strftime('%Y-%m-%dT%H:%M:%SZ', ts, '+' || ?5 || ' seconds') < ?4
+  ),
+  totals AS (
+    SELECT s.ts, COALESCE(SUM(m.avg_bit_rate), 0) AS val
+    FROM slots s
+    LEFT JOIN tunnel_metrics_daily m
+      ON strftime('%Y-%m-%dT%H:%M:%SZ', m.ts) = s.ts AND m.direction = ?1
+      AND m.tunnel_name NOT IN (SELECT value FROM json_each(?3))
+    GROUP BY s.ts
   ),
   ranked AS (
     SELECT val,
@@ -167,6 +211,8 @@ export const P95_AGGREGATE_DAILY_SQL = `
 
 // ── Paginated tunnel list ───────────────────────────────────────────────────
 
+// Bind params: ?1=since, ?2=pageSize, ?3=offset, ?4=until, ?5=step_seconds
+// If hasSearch: ?6=searchPattern
 export function buildPaginatedTunnelsSql(
   table: 'raw' | 'hourly' | 'daily',
   sortColumn: string,
@@ -179,15 +225,32 @@ export function buildPaginatedTunnelsSql(
       ? 'tunnel_metrics_hourly'
       : 'tunnel_metrics_daily';
   const valueCol = table === 'raw' ? 'bit_rate' : 'avg_bit_rate';
-  const searchFilter = hasSearch ? 'AND tunnel_name LIKE ?4' : '';
 
   return `
-    WITH ranked AS (
-      SELECT tunnel_name, direction, ${valueCol} AS val,
-             ROW_NUMBER() OVER (PARTITION BY tunnel_name, direction ORDER BY ${valueCol}) AS rn,
+    WITH RECURSIVE slots(ts) AS (
+      SELECT strftime('%Y-%m-%dT%H:%M:%SZ', ?1)
+      UNION ALL
+      SELECT strftime('%Y-%m-%dT%H:%M:%SZ', ts, '+' || ?5 || ' seconds') FROM slots
+      WHERE strftime('%Y-%m-%dT%H:%M:%SZ', ts, '+' || ?5 || ' seconds') < ?4
+    ),
+    tunnel_names AS (
+      SELECT DISTINCT tunnel_name FROM ${source}
+      WHERE ts >= ?1 ${hasSearch ? 'AND tunnel_name LIKE ?6' : ''}
+    ),
+    filled AS (
+      SELECT tn.tunnel_name, d.direction, s.ts,
+             COALESCE(m.${valueCol}, 0) AS val
+      FROM tunnel_names tn
+      CROSS JOIN (SELECT 'ingress' AS direction UNION ALL SELECT 'egress') d
+      CROSS JOIN slots s
+      LEFT JOIN ${source} m
+        ON m.tunnel_name = tn.tunnel_name AND m.direction = d.direction AND strftime('%Y-%m-%dT%H:%M:%SZ', m.ts) = s.ts
+    ),
+    ranked AS (
+      SELECT tunnel_name, direction, val,
+             ROW_NUMBER() OVER (PARTITION BY tunnel_name, direction ORDER BY val) AS rn,
              COUNT(*) OVER (PARTITION BY tunnel_name, direction) AS n
-      FROM ${source}
-      WHERE ts >= ?1 ${searchFilter}
+      FROM filled
     ),
     p95 AS (
       SELECT tunnel_name, direction, val AS p95_bps

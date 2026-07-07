@@ -38,6 +38,24 @@ export function rangeToTable(range: string, customDays?: number): 'raw' | 'hourl
   return 'raw';
 }
 
+export function rangeToUntil(range: string, _customStart?: string, customEnd?: string): string {
+  if (range === 'custom' && customEnd) return customEnd;
+  return new Date().toISOString();
+}
+
+export function tableToStepSeconds(table: 'raw' | 'hourly' | 'daily'): number {
+  if (table === 'raw') return 300;
+  if (table === 'hourly') return 3600;
+  return 86400;
+}
+
+export function snapToStep(iso: string, stepSeconds: number): string {
+  const ms = new Date(iso).getTime();
+  const stepMs = stepSeconds * 1000;
+  const snapped = Math.floor(ms / stepMs) * stepMs;
+  return new Date(snapped).toISOString();
+}
+
 export function snapToFiveMin(d: Date): Date {
   const snapped = new Date(d);
   snapped.setUTCMinutes(Math.floor(snapped.getUTCMinutes() / 5) * 5, 0, 0);
