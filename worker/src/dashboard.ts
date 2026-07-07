@@ -458,8 +458,9 @@ export function getDashboardHTML(): string {
         stepMs = 86400000;
       }
 
+      var snappedStart = Math.floor(chartStart.getTime() / stepMs) * stepMs;
       var timeline = [];
-      var t = chartStart.getTime();
+      var t = snappedStart;
       var endMs = chartEnd.getTime();
       while (t <= endMs) {
         timeline.push(new Date(t));
