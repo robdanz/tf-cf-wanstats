@@ -431,11 +431,39 @@ export function getDashboardHTML(): string {
       if (names.length === 0) return;
 
       var range = document.getElementById('range').value;
+      var now = new Date();
       var chartEnd;
-      if (range === 'custom' && customEnd) {
+      var chartStart;
+      var stepMs;
+      if (range === 'custom' && customStart && customEnd) {
+        chartStart = new Date(customStart);
         chartEnd = new Date(customEnd);
+        var spanMs = chartEnd.getTime() - chartStart.getTime();
+        if (spanMs <= 86400000) { stepMs = 300000; }
+        else if (spanMs <= 2592000000) { stepMs = 3600000; }
+        else { stepMs = 86400000; }
+      } else if (range === '24h') {
+        chartEnd = now;
+        chartStart = new Date(now.getTime() - 86400000);
+        stepMs = 300000;
+      } else if (range === '7d' || range === '30d') {
+        chartEnd = now;
+        var days = range === '7d' ? 7 : 30;
+        chartStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - days));
+        stepMs = 3600000;
       } else {
-        chartEnd = new Date();
+        chartEnd = now;
+        var d2 = range === '90d' ? 90 : 180;
+        chartStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - d2));
+        stepMs = 86400000;
+      }
+
+      var timeline = [];
+      var t = chartStart.getTime();
+      var endMs = chartEnd.getTime();
+      while (t <= endMs) {
+        timeline.push(new Date(t));
+        t += stepMs;
       }
 
       var batchUrl = '/api/metrics?tunnels=' + names.map(encodeURIComponent).join(',') + '&' + rangeParams;
@@ -446,7 +474,7 @@ export function getDashboardHTML(): string {
           var tunnelMetrics = data.tunnels || {};
           names.forEach(function(name) {
             if (tunnelMetrics[name] && canvasMap[name]) {
-              populateChart(name, canvasMap[name], tunnelMetrics[name], chartEnd);
+              populateChart(name, canvasMap[name], tunnelMetrics[name], timeline, chartStart, chartEnd);
             }
           });
         })
@@ -527,7 +555,7 @@ export function getDashboardHTML(): string {
       return canvas;
     }
 
-    function populateChart(tunnelName, canvas, metrics, chartEnd) {
+    function populateChart(tunnelName, canvas, metrics, timeline, chartStart, chartEnd) {
       if (!canvas.parentNode) return;
 
       var loading = canvas.parentNode.querySelector('.chart-loading');
@@ -538,20 +566,14 @@ export function getDashboardHTML(): string {
       var ingress = metrics.ingress || [];
       var egress = metrics.egress || [];
 
-      var tsSet = {};
-      var i;
-      for (i = 0; i < ingress.length; i++) tsSet[ingress[i].ts] = true;
-      for (i = 0; i < egress.length; i++) tsSet[egress[i].ts] = true;
-      var allTs = Object.keys(tsSet).sort();
-
       var ingressMap = {};
       var egressMap = {};
-      for (i = 0; i < ingress.length; i++) ingressMap[ingress[i].ts] = ingress[i].bps;
-      for (i = 0; i < egress.length; i++) egressMap[egress[i].ts] = egress[i].bps;
+      var i;
+      for (i = 0; i < ingress.length; i++) ingressMap[new Date(ingress[i].ts).getTime()] = ingress[i].bps;
+      for (i = 0; i < egress.length; i++) egressMap[new Date(egress[i].ts).getTime()] = egress[i].bps;
 
-      var labels = allTs.map(function(ts) { return new Date(ts); });
-      var ingressArr = allTs.map(function(ts) { return ingressMap[ts] !== undefined ? ingressMap[ts] / 1e6 : 0; });
-      var egressArr = allTs.map(function(ts) { return egressMap[ts] !== undefined ? egressMap[ts] / 1e6 : 0; });
+      var ingressArr = timeline.map(function(d) { var v = ingressMap[d.getTime()]; return v !== undefined ? v / 1e6 : 0; });
+      var egressArr = timeline.map(function(d) { var v = egressMap[d.getTime()]; return v !== undefined ? v / 1e6 : 0; });
 
       var p95In = metrics.p95_ingress_bps !== null ? metrics.p95_ingress_bps / 1e6 : null;
       var p95Eg = metrics.p95_egress_bps !== null ? metrics.p95_egress_bps / 1e6 : null;
@@ -561,31 +583,31 @@ export function getDashboardHTML(): string {
       activeCharts[tunnelName] = new Chart(canvas, {
         type: 'line',
         data: {
-          labels: labels,
+          labels: timeline,
           datasets: [
             {
               label: 'Ingress',
               data: ingressArr,
               borderColor: '#3b82f6',
               backgroundColor: 'rgba(59,130,246,0.07)',
-              borderWidth: 2, pointRadius: 0, tension: 0.2, fill: true, spanGaps: true
+              borderWidth: 2, pointRadius: 0, tension: 0.2, fill: true
             },
             {
               label: 'Egress',
               data: egressArr,
               borderColor: '#f97316',
               backgroundColor: 'rgba(249,115,22,0.07)',
-              borderWidth: 2, pointRadius: 0, tension: 0.2, fill: true, spanGaps: true
+              borderWidth: 2, pointRadius: 0, tension: 0.2, fill: true
             },
             {
               label: 'p95 Ingress',
-              data: Array(allTs.length).fill(p95In),
+              data: Array(timeline.length).fill(p95In),
               borderColor: '#3b82f6', borderDash: [6, 4],
               borderWidth: 1.5, pointRadius: 0, hidden: true, fill: false
             },
             {
               label: 'p95 Egress',
-              data: Array(allTs.length).fill(p95Eg),
+              data: Array(timeline.length).fill(p95Eg),
               borderColor: '#f97316', borderDash: [6, 4],
               borderWidth: 1.5, pointRadius: 0, hidden: true, fill: false
             }
@@ -608,6 +630,7 @@ export function getDashboardHTML(): string {
             y: { title: { display: true, text: 'Mbps' }, beginAtZero: true },
             x: {
               type: 'time',
+              min: chartStart,
               max: chartEnd,
               time: { tooltipFormat: 'MMM d, h:mm a' },
               ticks: { maxTicksLimit: 10, maxRotation: 0 }
