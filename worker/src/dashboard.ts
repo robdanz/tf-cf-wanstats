@@ -239,6 +239,19 @@ export function getDashboardHTML(): string {
       return bps.toFixed(0) + ' bps';
     }
 
+    function fetchJson(url) {
+      return fetch(url).then(function(r) {
+        if (!r.ok) {
+          return r.text().then(function(body) {
+            var msg;
+            try { msg = JSON.parse(body).error; } catch (e) { /* non-JSON error body */ }
+            throw new Error('HTTP ' + r.status + (msg ? ': ' + msg : ' from ' + url));
+          });
+        }
+        return r.json();
+      });
+    }
+
     function formatLabel(ts) {
       var d = new Date(ts);
       return d.toLocaleDateString(undefined, {month: 'short', day: 'numeric'}) + ' ' +
@@ -276,8 +289,7 @@ export function getDashboardHTML(): string {
       var rangeParams = buildRangeParams();
       var excl = Object.keys(excludedTunnels);
       var q = '/api/summary?' + rangeParams + (excl.length ? '&exclude=' + excl.map(encodeURIComponent).join(',') : '');
-      fetch(q)
-        .then(function(r) { return r.json(); })
+      fetchJson(q)
         .then(function(s) {
           document.getElementById('p95-ingress').textContent = formatBps(s.p95_ingress_bps);
           document.getElementById('p95-egress').textContent = formatBps(s.p95_egress_bps);
@@ -388,8 +400,7 @@ export function getDashboardHTML(): string {
       var url = '/api/tunnels?' + rangeParams + '&page=' + currentPage + '&pageSize=' + PAGE_SIZE + '&sort=' + sort + '&dir=' + sortDir;
       if (search) url += '&search=' + encodeURIComponent(search);
 
-      fetch(url)
-        .then(function(r) { return r.json(); })
+      fetchJson(url)
         .then(function(data) {
           totalTunnels = data.total;
           totalPages = data.totalPages;
@@ -469,8 +480,7 @@ export function getDashboardHTML(): string {
 
       var batchUrl = '/api/metrics?tunnels=' + names.map(encodeURIComponent).join(',') + '&' + rangeParams;
 
-      fetch(batchUrl)
-        .then(function(r) { return r.json(); })
+      fetchJson(batchUrl)
         .then(function(data) {
           var tunnelMetrics = data.tunnels || {};
           names.forEach(function(name) {
@@ -654,8 +664,7 @@ export function getDashboardHTML(): string {
     // -- Billing --
 
     function loadBillingP95() {
-      fetch('/api/billing')
-        .then(function(r) { return r.json(); })
+      fetchJson('/api/billing')
         .then(function(data) {
           var c = data.current;
           document.getElementById('billing-current-label').textContent = c.period;
@@ -748,8 +757,8 @@ export function getDashboardHTML(): string {
       var exclSuffix = excl.length ? '&exclude=' + excl.map(encodeURIComponent).join(',') : '';
 
       Promise.all([
-        fetch('/api/summary?' + rangeParams + exclSuffix).then(function(r) { return r.json(); }),
-        fetch('/api/billing').then(function(r) { return r.json(); })
+        fetchJson('/api/summary?' + rangeParams + exclSuffix),
+        fetchJson('/api/billing')
       ]).then(function(results) {
         var summary = results[0];
         var billingData = results[1];

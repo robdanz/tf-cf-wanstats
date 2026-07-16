@@ -79,6 +79,13 @@ export async function purgeOldData(db: D1Database): Promise<{
 
 // ── SQL for per-tunnel p95 ──────────────────────────────────────────────────
 // Bind params: ?1=tunnel_name, ?2=direction, ?3=since, ?4=until, ?5=step_seconds
+//
+// ts format contract: raw rows store 'YYYY-MM-DDTHH:MM:SSZ' (GraphQL
+// datetimeFiveMinutes), hourly/daily rows store toISOString()
+// 'YYYY-MM-DDTHH:MM:SS.000Z'. Slot-join conditions must transform the slot
+// side (replace(s.ts, 'Z', '.000Z')), never wrap m.ts in strftime() — a
+// function around m.ts defeats the (tunnel_name, direction, ts) index and
+// turns the join into a full scan per slot (>30s on D1 at ~550 tunnels).
 
 export const P95_PER_TUNNEL_RAW_SQL = `
   WITH RECURSIVE slots(ts) AS (
@@ -111,7 +118,7 @@ export const P95_PER_TUNNEL_HOURLY_SQL = `
            COUNT(*) OVER () AS n
     FROM slots s
     LEFT JOIN tunnel_metrics_hourly m
-      ON strftime('%Y-%m-%dT%H:%M:%SZ', m.ts) = s.ts AND m.tunnel_name = ?1 AND m.direction = ?2
+      ON m.ts = replace(s.ts, 'Z', '.000Z') AND m.tunnel_name = ?1 AND m.direction = ?2
   )
   SELECT val FROM ranked WHERE rn = CAST(CEIL(0.95 * n) AS INTEGER) LIMIT 1
 `;
@@ -129,7 +136,7 @@ export const P95_PER_TUNNEL_DAILY_SQL = `
            COUNT(*) OVER () AS n
     FROM slots s
     LEFT JOIN tunnel_metrics_daily m
-      ON strftime('%Y-%m-%dT%H:%M:%SZ', m.ts) = s.ts AND m.tunnel_name = ?1 AND m.direction = ?2
+      ON m.ts = replace(s.ts, 'Z', '.000Z') AND m.tunnel_name = ?1 AND m.direction = ?2
   )
   SELECT val FROM ranked WHERE rn = CAST(CEIL(0.95 * n) AS INTEGER) LIMIT 1
 `;
@@ -172,7 +179,7 @@ export const P95_AGGREGATE_HOURLY_SQL = `
     SELECT s.ts, COALESCE(SUM(m.avg_bit_rate), 0) AS val
     FROM slots s
     LEFT JOIN tunnel_metrics_hourly m
-      ON strftime('%Y-%m-%dT%H:%M:%SZ', m.ts) = s.ts AND m.direction = ?1
+      ON m.ts = replace(s.ts, 'Z', '.000Z') AND m.direction = ?1
       AND m.tunnel_name NOT IN (SELECT value FROM json_each(?3))
     GROUP BY s.ts
   ),
@@ -196,7 +203,7 @@ export const P95_AGGREGATE_DAILY_SQL = `
     SELECT s.ts, COALESCE(SUM(m.avg_bit_rate), 0) AS val
     FROM slots s
     LEFT JOIN tunnel_metrics_daily m
-      ON strftime('%Y-%m-%dT%H:%M:%SZ', m.ts) = s.ts AND m.direction = ?1
+      ON m.ts = replace(s.ts, 'Z', '.000Z') AND m.direction = ?1
       AND m.tunnel_name NOT IN (SELECT value FROM json_each(?3))
     GROUP BY s.ts
   ),
@@ -225,6 +232,9 @@ export function buildPaginatedTunnelsSql(
       ? 'tunnel_metrics_hourly'
       : 'tunnel_metrics_daily';
   const valueCol = table === 'raw' ? 'bit_rate' : 'avg_bit_rate';
+  // See ts format contract above: raw ts already matches the slot format;
+  // rollup ts carries toISOString() milliseconds, so pad the slot side.
+  const slotTs = table === 'raw' ? 's.ts' : "replace(s.ts, 'Z', '.000Z')";
 
   return `
     WITH RECURSIVE slots(ts) AS (
@@ -244,7 +254,7 @@ export function buildPaginatedTunnelsSql(
       CROSS JOIN (SELECT 'ingress' AS direction UNION ALL SELECT 'egress') d
       CROSS JOIN slots s
       LEFT JOIN ${source} m
-        ON m.tunnel_name = tn.tunnel_name AND m.direction = d.direction AND strftime('%Y-%m-%dT%H:%M:%SZ', m.ts) = s.ts
+        ON m.tunnel_name = tn.tunnel_name AND m.direction = d.direction AND m.ts = ${slotTs}
     ),
     ranked AS (
       SELECT tunnel_name, direction, val,

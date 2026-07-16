@@ -18,7 +18,15 @@ export default {
     }
 
     if (url.pathname.startsWith('/api/')) {
-      return handleApiRequest(request, env);
+      try {
+        return await handleApiRequest(request, env);
+      } catch (err) {
+        console.error(`API error on ${url.pathname}:`, err);
+        return Response.json(
+          { error: err instanceof Error ? err.message : String(err) },
+          { status: 500 },
+        );
+      }
     }
 
     return new Response('Not found', { status: 404 });
