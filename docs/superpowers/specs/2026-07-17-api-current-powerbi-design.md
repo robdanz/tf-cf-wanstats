@@ -36,14 +36,22 @@ intercepted. `scripts/backfill.sh` gains optional
 set, the curl sends the corresponding Access headers. Unset, behavior is
 unchanged (for deployments without Access, e.g. rob-danz).
 
-## Component 1 — `GET /api/current?window=60`
+## Component 1 — `GET /api/current?window=20`
 
 Returns every raw 5-minute sample for all tunnels in the trailing window, from
 D1 `tunnel_metrics`, in **one query** using the existing `(direction, ts)`
 index (`idx_tm_direction_ts`). No pagination.
 
-- `window` — minutes, default `60`, clamped to `[5, 1440]` (raw retention is
+- `window` — minutes, default `20`, clamped to `[5, 1440]` (raw retention is
   7 days; a poller never needs more than a day). Non-numeric input → default.
+  The default matches the light-run ingest lookback: each poll picks up the
+  newest bucket plus the three still-settling ones, and up to three missed
+  polls self-heal. Larger windows work but multiply D1 rows read — at 1,000
+  tunnels a 60-min window polled every 5 min is ~6.9M rows read/day, which
+  alone would exceed the Workers Free plan's 5M/day D1 read limit; the 20-min
+  default is ~2.3M/day. Data revised by the hourly 65-min authoritative pass
+  beyond the 20-min horizon is not re-delivered; callers who care can request
+  `window=70` occasionally.
 - Query (sargable; bare `ts >= ?` would not use the index):
 
 ```sql
@@ -60,8 +68,8 @@ ORDER BY tunnel_name, direction, ts
 ```json
 {
   "generated_at": "2026-07-17T18:05:12.345Z",
-  "window_minutes": 60,
-  "row_count": 13296,
+  "window_minutes": 20,
+  "row_count": 4432,
   "rows": [
     { "tunnel_name": "site-a", "direction": "ingress",
       "ts": "2026-07-17T17:05:00.000Z", "bit_rate_bps": 12345.6 }
@@ -71,7 +79,7 @@ ORDER BY tunnel_name, direction, ts
 
 - Headers: `Cache-Control: no-store` (plus existing `Content-Type`).
 - Errors flow through the existing route try/catch in `index.ts` → JSON 500.
-- Scale: 1,000 tunnels × 2 directions × 12 buckets ≈ 24k rows ≈ 1.5 MB JSON.
+- Scale: 1,000 tunnels × 2 directions × 4 buckets ≈ 8k rows ≈ 0.5 MB JSON.
   One D1 subrequest, index range scan, sub-second.
 
 Implementation lands in `api.ts` (handler) + `d1.ts` (query fn) + route
@@ -133,14 +141,14 @@ No other script behavior changes.
 2. `wrangler dev`: `curl "http://localhost:8787/__scheduled?cron=*/5+*+*+*+*"`
    — verify light path (D1 write only) when wall-clock minute ≥ 5, full path
    when minute < 5; confirm via log lines which path ran.
-3. `curl "http://localhost:8787/api/current?window=60"` — shape, clamping
+3. `curl "http://localhost:8787/api/current"` — default window, shape, clamping
    (`window=1`, `window=99999`, `window=abc`), `no-store` header.
 4. Deploy to rob-danz via `terraform apply`; verify `/api/current` live and
    confirm 5-minute cron runs appear in `npm run tail` / metadata
    `last_cron_run` advancing every 5 minutes.
 5. After customer pulls + applies: probe
    `https://tf-cf-wanstats.accenture-iot.workers.dev/api/current` at
-   ~554-tunnel scale (expect <1.5 s, ~13k rows for 60 min) — with service
+   ~554-tunnel scale (expect <1.5 s, ~4.4k rows for the 20-min default) — with service
    token headers once Access is enabled.
 
 ## Deployment
