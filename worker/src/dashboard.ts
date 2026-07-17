@@ -248,7 +248,13 @@ export function getDashboardHTML(): string {
             throw new Error('HTTP ' + r.status + (msg ? ': ' + msg : ' from ' + url));
           });
         }
-        return r.json();
+        return r.text().then(function(body) {
+          try { return JSON.parse(body); } catch (e) {
+            var looksHtml = /^\s*</.test(body);
+            throw new Error((looksHtml ? 'Received an HTML page instead of JSON' : 'Received a non-JSON response') +
+              ' from ' + url + ' (status ' + r.status + ') — likely an expired login session or a proxy intercept; reload the page.');
+          }
+        });
       });
     }
 
@@ -491,6 +497,15 @@ export function getDashboardHTML(): string {
         })
         .catch(function(err) {
           console.error('Failed to load batch metrics:', err);
+          names.forEach(function(name) {
+            var canvas = canvasMap[name];
+            if (canvas && canvas.parentNode) {
+              var msg = document.createElement('p');
+              msg.className = 'status error';
+              msg.textContent = 'Error: ' + (err.message || err);
+              canvas.parentNode.replaceChild(msg, canvas);
+            }
+          });
         });
     }
 
