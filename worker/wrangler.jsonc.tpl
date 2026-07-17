@@ -7,7 +7,7 @@
   "account_id": "${account_id}",
   "workers_dev": true,
   "triggers": {
-    "crons": ["0 * * * *"]
+    "crons": ["*/5 * * * *"]
   },
   "d1_databases": [
     {

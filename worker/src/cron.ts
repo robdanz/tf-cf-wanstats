@@ -6,13 +6,22 @@ import { snapToHour, snapToDay, toPeriod } from './utils';
 
 export async function handleCron(env: Env): Promise<void> {
   const now = new Date();
-  const sixtyFiveMinutesAgo = new Date(now.getTime() - 65 * 60 * 1000);
+  // Cron fires every 5 minutes. The minute-0 slot is the authoritative full
+  // run (65-min lookback, R2 write, rollups, daily tasks); the other slots
+  // are light runs that only refresh recent raw data in D1. The 20-min light
+  // lookback covers Analytics API data latency; INSERT OR REPLACE lets
+  // late-arriving buckets settle on subsequent runs.
+  const fullRun = now.getUTCMinutes() < 5;
+  const lookbackMinutes = fullRun ? 65 : 20;
+  const windowStart = new Date(now.getTime() - lookbackMinutes * 60 * 1000);
+
+  console.log(`Cron run: ${fullRun ? 'full' : 'light'} (lookback ${lookbackMinutes}m)`);
 
   // Step 1: Fetch via time-sliced GraphQL
   const { ingress, egress, warnings } = await fetchMetricsTimeSliced(
     env.ACCOUNT_ID,
     env.WAN_API_TOKEN,
-    sixtyFiveMinutesAgo,
+    windowStart,
     now,
   );
 
@@ -29,6 +38,17 @@ export async function handleCron(env: Env): Promise<void> {
 
   if (tunnelNames.size >= 2500) {
     console.warn(`CAPACITY WARNING: ${tunnelNames.size} tunnels detected. GraphQL limit may need increasing.`);
+  }
+
+  if (!fullRun) {
+    // Light run: D1 only. R2, rollups, and retention stay on the full run so
+    // hourly CSV objects and billing p95 remain byte-identical to before.
+    await Promise.all([
+      storeTunnelMetrics(env.DB, ingress, 'ingress'),
+      storeTunnelMetrics(env.DB, egress, 'egress'),
+    ]);
+    console.log(`D1 (light): stored ${ingress.length} ingress + ${egress.length} egress rows`);
+    return;
   }
 
   // Step 2: Dual-write D1 + R2
