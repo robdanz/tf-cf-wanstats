@@ -9,6 +9,7 @@ import {
   getBillingP95Summary,
   getBillingP95Tunnels,
   storeTunnelMetrics,
+  CURRENT_METRICS_SQL,
 } from './d1';
 import { fetchMetricsTimeSliced } from './graphql';
 import { writeRawToR2, streamCsvExport } from './r2';
@@ -251,6 +252,31 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
         'Content-Disposition': `attachment; filename="${filename}"`,
       },
     });
+  }
+
+  if (pathname === '/api/current') {
+    const windowParam = parseInt(url.searchParams.get('window') ?? '', 10);
+    const windowMinutes = isNaN(windowParam) ? 20 : Math.min(1440, Math.max(5, windowParam));
+    const now = new Date();
+    // Match the raw ts storage format (no milliseconds) for clean string comparison.
+    const since = new Date(now.getTime() - windowMinutes * 60 * 1000)
+      .toISOString().slice(0, 19) + 'Z';
+
+    const { results } = await env.DB.prepare(CURRENT_METRICS_SQL)
+      .bind(since)
+      .all<{ tunnel_name: string; direction: string; ts: string; bit_rate: number }>();
+
+    return Response.json({
+      generated_at: now.toISOString(),
+      window_minutes: windowMinutes,
+      row_count: results.length,
+      rows: results.map((r) => ({
+        tunnel_name: r.tunnel_name,
+        direction: r.direction,
+        ts: r.ts,
+        bit_rate_bps: r.bit_rate,
+      })),
+    }, { headers: { 'Cache-Control': 'no-store' } });
   }
 
   return new Response('Not found', { status: 404 });

@@ -77,6 +77,20 @@ export async function purgeOldData(db: D1Database): Promise<{
   };
 }
 
+// ── Current-window bulk query (/api/current) ────────────────────────────────
+// Bind: ?1 = since, in raw ts format 'YYYY-MM-DDTHH:MM:SSZ'.
+// Per-direction predicates keep idx_tm_direction_ts (direction, ts) in play;
+// a bare "ts >= ?" would full-scan tunnel_metrics (millions of rows at
+// 500+ tunnels x 7-day retention).
+export const CURRENT_METRICS_SQL = `
+  SELECT tunnel_name, direction, ts, bit_rate FROM tunnel_metrics
+  WHERE direction = 'ingress' AND ts >= ?1
+  UNION ALL
+  SELECT tunnel_name, direction, ts, bit_rate FROM tunnel_metrics
+  WHERE direction = 'egress' AND ts >= ?1
+  ORDER BY tunnel_name, direction, ts
+`;
+
 // ── SQL for per-tunnel p95 ──────────────────────────────────────────────────
 // Bind params: ?1=tunnel_name, ?2=direction, ?3=since, ?4=until, ?5=step_seconds
 //
