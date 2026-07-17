@@ -16,6 +16,10 @@
 #   WORKER_URL      e.g. https://tf-cf-wanstats.<subdomain>.workers.dev
 #   BACKFILL_TOKEN  value from terraform.tfvars
 #
+# Optional (required when the worker hostname is behind Cloudflare Access):
+#   CF_ACCESS_CLIENT_ID      Access service token client ID
+#   CF_ACCESS_CLIENT_SECRET  Access service token client secret
+#
 # Example:
 #   export WORKER_URL=https://tf-cf-wanstats.mysubdomain.workers.dev
 #   export BACKFILL_TOKEN=<your-token>
@@ -39,6 +43,17 @@ fi
 if [[ -z "${BACKFILL_TOKEN:-}" ]]; then
   echo "Error: BACKFILL_TOKEN is not set" >&2
   exit 1
+fi
+
+# Cloudflare Access service token headers (only when both vars are set).
+# The ${arr[@]+...} expansion form is required: macOS ships bash 3.2, where
+# expanding an empty array under `set -u` is an unbound-variable error.
+ACCESS_HEADERS=()
+if [[ -n "${CF_ACCESS_CLIENT_ID:-}" && -n "${CF_ACCESS_CLIENT_SECRET:-}" ]]; then
+  ACCESS_HEADERS=(
+    -H "CF-Access-Client-Id: ${CF_ACCESS_CLIENT_ID}"
+    -H "CF-Access-Client-Secret: ${CF_ACCESS_CLIENT_SECRET}"
+  )
 fi
 
 # Convert ISO 8601 to epoch seconds (macOS date)
@@ -84,7 +99,8 @@ while [[ "$current" -lt "$end_epoch" ]]; do
 
   response=$(curl -s -X POST \
     "${WORKER_URL}/api/backfill?start=${window_start}&end=${window_end}" \
-    -H "X-Backfill-Token: ${BACKFILL_TOKEN}")
+    -H "X-Backfill-Token: ${BACKFILL_TOKEN}" \
+    ${ACCESS_HEADERS[@]+"${ACCESS_HEADERS[@]}"})
 
   if echo "$response" | grep -q '"ingress_rows"'; then
     in_rows=$(echo "$response" | sed 's/.*"ingress_rows":\([0-9]*\).*/\1/')
