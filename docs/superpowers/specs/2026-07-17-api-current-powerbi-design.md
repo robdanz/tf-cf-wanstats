@@ -15,7 +15,10 @@ Rate limiting was investigated and is a non-issue: Workers have no
 requests-per-second limit (Free plan cap is 100,000 requests/day; a 5-minute
 poll is 288/day), D1 calls are internal subrequests (1,000/invocation Free,
 10,000 Paid), and Cloudflare Access imposes no rate limit on service-token
-requests.
+requests. Note the */5 ingest raises D1 row-writes ~4.4x (~2.7M/day at
+1,000 tunnels) — beyond Free-plan D1 write limits, but the pre-existing
+hourly ingest at 500+ tunnels already required the Workers Paid plan, where
+this sits well inside the 50M/day allowance.
 
 ## Authentication
 
@@ -72,7 +75,7 @@ ORDER BY tunnel_name, direction, ts
   "row_count": 4432,
   "rows": [
     { "tunnel_name": "site-a", "direction": "ingress",
-      "ts": "2026-07-17T17:05:00.000Z", "bit_rate_bps": 12345.6 }
+      "ts": "2026-07-17T17:05:00Z", "bit_rate_bps": 12345.6 }
   ]
 }
 ```
@@ -82,8 +85,8 @@ ORDER BY tunnel_name, direction, ts
 - Scale: 1,000 tunnels × 2 directions × 4 buckets ≈ 8k rows ≈ 0.5 MB JSON.
   One D1 subrequest, index range scan, sub-second.
 
-Implementation lands in `api.ts` (handler) + `d1.ts` (query fn) + route
-registration in `index.ts`, following the existing per-endpoint pattern.
+Implementation lands in `api.ts` (route block in `handleApiRequest`) +
+`d1.ts` (SQL constant); `index.ts` already delegates all `/api/*` paths.
 
 ## Component 2 — cron split: light/full runs
 
