@@ -75,23 +75,36 @@ export function generateTimeSlices(start: Date, end: Date): TimeSlice[] {
   return slices;
 }
 
+const MAX_FETCH_RETRIES = 3;
+
 async function fetchSingleBucket(
   accountId: string,
   apiToken: string,
   datetimeStart: string,
   datetimeEnd: string,
 ): Promise<{ ingress: IngressRow[]; egress: EgressRow[] }> {
-  const response = await fetch('https://api.cloudflare.com/client/v4/graphql', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${apiToken}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      query: GRAPHQL_QUERY,
-      variables: { accountTag: accountId, datetimeStart, datetimeEnd },
-    }),
-  });
+  let response: Response;
+  for (let attempt = 0; ; attempt++) {
+    response = await fetch('https://api.cloudflare.com/client/v4/graphql', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        query: GRAPHQL_QUERY,
+        variables: { accountTag: accountId, datetimeStart, datetimeEnd },
+      }),
+    });
+
+    const retryable = response.status === 429 || response.status >= 500;
+    if (!retryable || attempt >= MAX_FETCH_RETRIES) break;
+
+    const retryAfter = parseInt(response.headers.get('Retry-After') ?? '', 10);
+    const delayMs = Number.isFinite(retryAfter) ? retryAfter * 1000 : 2000 * 2 ** attempt;
+    console.warn(`GraphQL ${response.status} for ${datetimeStart}; retry ${attempt + 1}/${MAX_FETCH_RETRIES} in ${delayMs}ms`);
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+  }
 
   if (!response.ok) {
     throw new Error(`GraphQL request failed: ${response.status} ${response.statusText}`);

@@ -20,6 +20,13 @@
 #   CF_ACCESS_CLIENT_ID      Access service token client ID
 #   CF_ACCESS_CLIENT_SECRET  Access service token client secret
 #
+# Optional tuning:
+#   BACKFILL_SLEEP  seconds to pause between hour windows (default 15) —
+#                   each window costs 12 GraphQL queries against a shared
+#                   ~300-per-5-min API budget the live cron also uses
+#   RETRY_SLEEP     seconds to wait after a 429 before retrying (default 90)
+#   MAX_RETRIES     429 retries per window before giving up (default 5)
+#
 # Example:
 #   export WORKER_URL=https://tf-cf-wanstats.mysubdomain.workers.dev
 #   export BACKFILL_TOKEN=<your-token>
@@ -78,6 +85,10 @@ if [[ "$start_epoch" -ge "$end_epoch" ]]; then
   exit 1
 fi
 
+BACKFILL_SLEEP="${BACKFILL_SLEEP:-15}"
+RETRY_SLEEP="${RETRY_SLEEP:-90}"
+MAX_RETRIES="${MAX_RETRIES:-5}"
+
 HOUR=3600
 current=$start_epoch
 
@@ -99,29 +110,47 @@ while [[ "$current" -lt "$end_epoch" ]]; do
 
   printf "  %s → %s ... " "$window_start" "$window_end"
 
-  response=$(curl -s -X POST \
-    "${WORKER_URL}/api/backfill?start=${window_start}&end=${window_end}" \
-    -H "X-Backfill-Token: ${BACKFILL_TOKEN}" \
-    ${ACCESS_HEADERS[@]+"${ACCESS_HEADERS[@]}"})
+  attempt=1
+  while :; do
+    response=$(curl -s -X POST \
+      "${WORKER_URL}/api/backfill?start=${window_start}&end=${window_end}" \
+      -H "X-Backfill-Token: ${BACKFILL_TOKEN}" \
+      ${ACCESS_HEADERS[@]+"${ACCESS_HEADERS[@]}"})
 
-  if echo "$response" | grep -q '"ingress_rows"'; then
-    in_rows=$(echo "$response" | sed 's/.*"ingress_rows":\([0-9]*\).*/\1/')
-    eg_rows=$(echo "$response" | sed 's/.*"egress_rows":\([0-9]*\).*/\1/')
-    echo "ingress=${in_rows} egress=${eg_rows}"
-    total_ingress=$((total_ingress + in_rows))
-    total_egress=$((total_egress + eg_rows))
-    windows=$((windows + 1))
-    # Show any data collection warnings (e.g., GraphQL limit reached)
-    if echo "$response" | grep -q '"warnings":\[\"'; then
-      echo "    WARNINGS in response" >&2
+    if echo "$response" | grep -q '"ingress_rows"'; then
+      in_rows=$(echo "$response" | sed 's/.*"ingress_rows":\([0-9]*\).*/\1/')
+      eg_rows=$(echo "$response" | sed 's/.*"egress_rows":\([0-9]*\).*/\1/')
+      echo "ingress=${in_rows} egress=${eg_rows}"
+      total_ingress=$((total_ingress + in_rows))
+      total_egress=$((total_egress + eg_rows))
+      windows=$((windows + 1))
+      # Show any data collection warnings (e.g., GraphQL limit reached)
+      if echo "$response" | grep -q '"warnings":\[\"'; then
+        echo "    WARNINGS in response" >&2
+      fi
+      break
+    elif echo "$response" | grep -q '429'; then
+      if [[ "$attempt" -ge "$MAX_RETRIES" ]]; then
+        echo "ERROR"
+        echo "    Rate limited after ${MAX_RETRIES} attempts. Re-run from ${window_start} later." >&2
+        exit 1
+      fi
+      printf "rate limited, waiting %ss (attempt %s/%s) ... " "$RETRY_SLEEP" "$attempt" "$MAX_RETRIES"
+      sleep "$RETRY_SLEEP"
+      attempt=$((attempt + 1))
+    else
+      echo "ERROR"
+      echo "    Response: $response" >&2
+      exit 1
     fi
-  else
-    echo "ERROR"
-    echo "    Response: $response" >&2
-    exit 1
-  fi
+  done
 
   current=$next
+  # Pace requests: each hour window costs 12 GraphQL queries against a
+  # shared ~300-per-5-min budget that the live cron also draws from.
+  if [[ "$current" -lt "$end_epoch" ]]; then
+    sleep "$BACKFILL_SLEEP"
+  fi
 done
 
 echo ""
