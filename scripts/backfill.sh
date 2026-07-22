@@ -57,9 +57,11 @@ if [[ -n "${CF_ACCESS_CLIENT_ID:-}" && -n "${CF_ACCESS_CLIENT_SECRET:-}" ]]; the
 fi
 
 # Convert ISO 8601 to epoch seconds (macOS date)
+# TZ=UTC is required: -f parses in the local zone and treats the trailing
+# "Z" as a literal, silently shifting the range by the UTC offset.
 to_epoch() {
-  date -j -f "%Y-%m-%dT%H:%M:%SZ" "$1" "+%s" 2>/dev/null \
-    || date -d "$1" "+%s"  # Linux fallback
+  TZ=UTC date -j -f "%Y-%m-%dT%H:%M:%SZ" "$1" "+%s" 2>/dev/null \
+    || date -u -d "$1" "+%s"  # Linux fallback
 }
 
 # Convert epoch seconds back to ISO 8601

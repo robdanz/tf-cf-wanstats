@@ -62,9 +62,11 @@ if [[ -n "${CF_ACCESS_CLIENT_ID:-}" && -n "${CF_ACCESS_CLIENT_SECRET:-}" ]]; the
 fi
 
 # Convert date to epoch seconds (macOS date, Linux fallback)
+# TZ=UTC is required: -f parses in the local zone, silently shifting the
+# range by the UTC offset.
 to_epoch() {
-  date -j -f "%Y-%m-%d" "$1" "+%s" 2>/dev/null \
-    || date -d "$1" "+%s"
+  TZ=UTC date -j -f "%Y-%m-%d" "$1" "+%s" 2>/dev/null \
+    || date -u -d "$1" "+%s"
 }
 
 # Convert epoch seconds back to YYYY-MM-DD
