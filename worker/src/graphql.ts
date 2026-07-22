@@ -60,12 +60,14 @@ export function generateTimeSlices(start: Date, end: Date): TimeSlice[] {
   const slices: TimeSlice[] = [];
   let current = snapToFiveMin(start);
 
-  while (current < end) {
+  // Only complete 5-min buckets: a partial slice (end mid-bucket) returns an
+  // average over a sliver of the window — garbage that pollutes R2/D1.
+  while (true) {
     const bucketEnd = new Date(current.getTime() + FIVE_MINUTES_MS);
-    const actualEnd = bucketEnd > end ? end : bucketEnd;
+    if (bucketEnd > end) break;
     slices.push({
       start: current.toISOString(),
-      end: actualEnd.toISOString(),
+      end: bucketEnd.toISOString(),
     });
     current = bucketEnd;
   }

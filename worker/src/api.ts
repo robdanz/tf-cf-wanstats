@@ -12,7 +12,7 @@ import {
   CURRENT_METRICS_SQL,
 } from './d1';
 import { fetchMetricsTimeSliced } from './graphql';
-import { writeRawToR2, streamCsvExport } from './r2';
+import { writeRawToR2, streamCsvExport, cleanupRawDay } from './r2';
 import { toPeriod } from './utils';
 
 const VALID_SORT_COLUMNS: Record<string, string> = {
@@ -30,6 +30,10 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
 
   if (pathname === '/api/backfill' && request.method === 'POST') {
     return handleBackfill(request, env);
+  }
+
+  if (pathname === '/api/cleanup' && request.method === 'POST') {
+    return handleCleanup(request, env);
   }
 
   if (pathname === '/api/tunnels') {
@@ -280,6 +284,23 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
   }
 
   return new Response('Not found', { status: 404 });
+}
+
+async function handleCleanup(request: Request, env: Env): Promise<Response> {
+  const provided = request.headers.get('X-Backfill-Token') ?? '';
+  if (!(await verifyToken(provided, env.BACKFILL_TOKEN))) {
+    return new Response('Unauthorized', { status: 401 });
+  }
+
+  const url = new URL(request.url);
+  const date = url.searchParams.get('date');
+  if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date) || isNaN(Date.parse(date))) {
+    return new Response('Missing or invalid date query param — use YYYY-MM-DD', { status: 400 });
+  }
+
+  const { filesProcessed, duplicatesRemoved } = await cleanupRawDay(env.RAW_METRICS, date);
+
+  return Response.json({ date, filesProcessed, duplicatesRemoved });
 }
 
 async function handleBackfill(request: Request, env: Env): Promise<Response> {

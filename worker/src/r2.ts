@@ -2,6 +2,28 @@ import type { NormalizedRow } from './types';
 
 const CSV_HEADER = 'tunnel_name,direction,ts,bit_rate';
 
+// Collapse CSV lines to one per tunnel,direction,ts key, keeping the max
+// bit rate. Legacy files hold duplicate keys (partial-bucket and settling
+// re-fetch writes); the partial value is always lower than the settled one.
+function collapseMaxPerKey(text: string): { lines: Map<string, string>; removed: number } {
+  const lines = new Map<string, string>();
+  let removed = 0;
+  for (const line of text.split('\n')) {
+    if (!line || line === CSV_HEADER) continue;
+    const lastComma = line.lastIndexOf(',');
+    const lineKey = line.slice(0, lastComma);
+    const prev = lines.get(lineKey);
+    if (prev !== undefined) {
+      removed++;
+      const prevRate = parseFloat(prev.slice(prev.lastIndexOf(',') + 1));
+      const rate = parseFloat(line.slice(lastComma + 1));
+      if (rate <= prevRate) continue;
+    }
+    lines.set(lineKey, line);
+  }
+  return { lines, removed };
+}
+
 export function buildCsvLines(rows: NormalizedRow[], direction: 'ingress' | 'egress'): string[] {
   return rows.map((r) => `${r.tunnelName},${direction},${r.ts},${r.bitRate}`);
 }
@@ -11,15 +33,21 @@ export async function writeRawToR2(
   ingress: NormalizedRow[],
   egress: NormalizedRow[],
 ): Promise<{ filesWritten: number; totalRows: number }> {
-  const hourBuckets = new Map<string, string[]>();
+  // Per hour file: rows keyed by tunnel,direction,ts. A bucket re-fetched
+  // with a different (settled) value must replace the old line, not coexist
+  // with it — the R2 equivalent of D1's INSERT OR REPLACE.
+  const hourBuckets = new Map<string, Map<string, string>>();
 
   function addRows(rows: NormalizedRow[], direction: 'ingress' | 'egress') {
     for (const row of rows) {
       const dateStr = row.ts.slice(0, 10);
       const hourStr = row.ts.slice(11, 13);
       const key = `${dateStr}/${hourStr}`;
-      if (!hourBuckets.has(key)) hourBuckets.set(key, []);
-      hourBuckets.get(key)!.push(`${row.tunnelName},${direction},${row.ts},${row.bitRate}`);
+      if (!hourBuckets.has(key)) hourBuckets.set(key, new Map());
+      hourBuckets.get(key)!.set(
+        `${row.tunnelName},${direction},${row.ts}`,
+        `${row.tunnelName},${direction},${row.ts},${row.bitRate}`,
+      );
     }
   }
 
@@ -29,19 +57,15 @@ export async function writeRawToR2(
   let totalRows = 0;
   const writes: Promise<void>[] = [];
 
-  for (const [key, lines] of hourBuckets) {
+  for (const [key, incoming] of hourBuckets) {
     const existingObj = await bucket.get(`raw/${key}.csv`);
-    const existingLines = new Set<string>();
-    if (existingObj) {
-      const text = await existingObj.text();
-      for (const line of text.split('\n')) {
-        if (line && line !== CSV_HEADER) existingLines.add(line);
-      }
-    }
+    const merged = existingObj
+      ? collapseMaxPerKey(await existingObj.text()).lines
+      : new Map<string, string>();
 
-    for (const line of lines) existingLines.add(line);
+    for (const [lineKey, line] of incoming) merged.set(lineKey, line);
 
-    const allLines = Array.from(existingLines).sort();
+    const allLines = Array.from(merged.values()).sort();
     totalRows += allLines.length;
     const csv = CSV_HEADER + '\n' + allLines.join('\n') + '\n';
 
@@ -241,6 +265,31 @@ export async function streamCsvExport(
       controller.close();
     },
   });
+}
+
+export async function cleanupRawDay(
+  bucket: R2Bucket,
+  dateStr: string,
+): Promise<{ filesProcessed: number; duplicatesRemoved: number }> {
+  const listed = await bucket.list({ prefix: `raw/${dateStr}/` });
+
+  let filesProcessed = 0;
+  let duplicatesRemoved = 0;
+
+  for (const obj of listed.objects) {
+    const body = await bucket.get(obj.key);
+    if (!body) continue;
+    filesProcessed++;
+
+    const { lines, removed } = collapseMaxPerKey(await body.text());
+    if (removed === 0) continue;
+    duplicatesRemoved += removed;
+
+    const csv = CSV_HEADER + '\n' + Array.from(lines.values()).sort().join('\n') + '\n';
+    await bucket.put(obj.key, csv);
+  }
+
+  return { filesProcessed, duplicatesRemoved };
 }
 
 export async function purgeOldR2Data(bucket: R2Bucket): Promise<number> {
