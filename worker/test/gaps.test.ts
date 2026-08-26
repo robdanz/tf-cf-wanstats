@@ -113,5 +113,34 @@ describe('runGapCheck discover phase', () => {
     const row = (await getPendingGaps(DB, 100)).find((p) => p.tunnelName === 'TUN_NEW');
     expect(row).toBeDefined();
     expect(row?.attempts).toBe(0);
+
+    await deleteResolvedGaps(DB, [{ tunnelName: 'TUN_NEW', direction: 'ingress', ts: '2026-08-03T10:00:00Z' }]); // avoid leaking into later tests
+    await deleteResolvedGaps(DB, [{ tunnelName: 'TUN_NEW', direction: 'egress', ts: '2026-08-03T10:00:00Z' }]);
+  });
+
+  it('does not report phantom gaps when the cron window is not 5-minute-aligned', async () => {
+    await applyTestSchema(DB);
+    // A fully-populated window: TUN_ALIGNED has both directions for every
+    // 5-minute bucket from 08:55:00Z through 10:00:00Z inclusive. Raw rows use
+    // the GraphQL ts format ('YYYY-MM-DDTHH:MM:SSZ', no milliseconds).
+    const rows = [];
+    for (let m = 0; m < 70; m += 5) {
+      const ts = new Date(new Date('2026-08-04T08:55:00Z').getTime() + m * 60 * 1000)
+        .toISOString().replace('.000Z', 'Z');
+      rows.push({ tunnelName: 'TUN_ALIGNED', ts, bitRate: 1 });
+    }
+    await storeTunnelMetrics(DB, rows, 'ingress');
+    await storeTunnelMetrics(DB, rows, 'egress');
+
+    vi.stubGlobal('fetch', vi.fn(() => { throw new Error('must not be called — no gaps expected'); }));
+
+    // Cron-shaped, unaligned wall-clock args (real invocations are never
+    // exactly on a 5-min boundary): now = 10:00:04.512Z, windowStart = 65min back.
+    const now = new Date('2026-08-04T10:00:04.512Z');
+    const windowStart = new Date(now.getTime() - 65 * 60 * 1000);
+    await runGapCheck(TEST_ENV, windowStart, now);
+
+    const pending = await getPendingGaps(DB, 100);
+    expect(pending.filter((p) => p.tunnelName === 'TUN_ALIGNED')).toHaveLength(0);
   });
 });

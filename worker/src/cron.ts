@@ -70,8 +70,13 @@ export async function handleCron(env: Env): Promise<void> {
   console.log(`Hourly rollup for ${completedHour.toISOString()}: ${rollupChanges} rows`);
 
   // Step 3.5: gap detection + bounded auto-repoll — retries previously-tracked
-  // pending cells first, then scans this run's window for new misses.
-  await runGapCheck(env, windowStart, now);
+  // pending cells first, then scans this run's window for new misses. Wrapped
+  // so a failure here can never skip the daily tasks below.
+  try {
+    await runGapCheck(env, windowStart, now);
+  } catch (err) {
+    console.error('Gap check failed:', err instanceof Error ? err.message : String(err));
+  }
 
   // Step 4: Daily tasks at hour 0 UTC
   if (now.getUTCHours() === 0) {

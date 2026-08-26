@@ -6,11 +6,16 @@ import {
   rollupHour, rollupDay,
 } from './d1';
 import { writeRawToR2 } from './r2';
-import { snapToHour, snapToDay } from './utils';
+import { snapToFiveMin, snapToHour, snapToDay } from './utils';
 
-const MAX_RANGES_PER_RUN = 20;
+// Budget per cron run, counted in 5-minute buckets: fetchMetricsTimeSliced
+// issues one sequential GraphQL request per bucket, so ranges (which can span
+// arbitrarily many buckets) are the wrong unit to cap on.
+const MAX_BUCKETS_PER_RUN = 20;
 const FIVE_MINUTES_MS = 5 * 60 * 1000;
-const MAX_PENDING_FETCH = 5000;
+// Max *distinct timestamps* pulled from gap_tracking per run — every cell for
+// a selected ts comes back, since one GraphQL call covers all tunnels for it.
+const MAX_PENDING_TIMESTAMPS = 500;
 
 export interface ContiguousRange {
   start: string;
@@ -40,11 +45,11 @@ export function groupIntoContiguousRanges(cells: TrackedGapCell[]): ContiguousRa
   }
   if (currentTsList.length > 0) ranges.push(finalizeRange(currentTsList, byTs));
 
-  ranges.sort((a, b) => {
-    const aMin = Math.min(...a.cells.map((c) => new Date(c.firstDetected).getTime()));
-    const bMin = Math.min(...b.cells.map((c) => new Date(c.firstDetected).getTime()));
-    return aMin - bMin;
-  });
+  // reduce(), not Math.min(...spread) — a very large cell array would blow the
+  // argument limit and throw RangeError.
+  const earliest = (cells: TrackedGapCell[]) =>
+    cells.reduce((min, c) => Math.min(min, new Date(c.firstDetected).getTime()), Infinity);
+  ranges.sort((a, b) => earliest(a.cells) - earliest(b.cells));
 
   return ranges;
 }
@@ -67,11 +72,21 @@ export async function runGapCheck(env: Env, windowStart: Date, windowEnd: Date):
 }
 
 async function retryPendingGaps(env: Env, now: Date): Promise<void> {
-  const pending = await getPendingGaps(env.DB, MAX_PENDING_FETCH);
+  const pending = await getPendingGaps(env.DB, MAX_PENDING_TIMESTAMPS);
   if (pending.length === 0) return;
 
   const ranges = groupIntoContiguousRanges(pending);
-  const toProcess = ranges.slice(0, MAX_RANGES_PER_RUN);
+  // Take whole ranges (never split one) until the next would blow the bucket
+  // budget. The toProcess.length > 0 guard lets a single oversized range run
+  // alone rather than starving behind the cap forever.
+  const toProcess: ContiguousRange[] = [];
+  let bucketCount = 0;
+  for (const range of ranges) {
+    const rangeBuckets = (new Date(range.end).getTime() - new Date(range.start).getTime()) / FIVE_MINUTES_MS;
+    if (toProcess.length > 0 && bucketCount + rangeBuckets > MAX_BUCKETS_PER_RUN) break;
+    toProcess.push(range);
+    bucketCount += rangeBuckets;
+  }
   if (ranges.length > toProcess.length) {
     console.warn(`Gap repoll: deferring ${ranges.length - toProcess.length} window(s) to next run (budget cap)`);
   }
@@ -87,7 +102,7 @@ async function retryPendingGaps(env: Env, now: Date): Promise<void> {
         env.ACCOUNT_ID, env.WAN_API_TOKEN, new Date(range.start), new Date(range.end),
       ));
     } catch (err) {
-      console.warn(`Gap repoll fetch failed for ${range.start}-${range.end}: ${(err as Error).message}`);
+      console.warn(`Gap repoll fetch failed for ${range.start}-${range.end}: ${err instanceof Error ? err.message : String(err)}`);
       continue;
     }
 
@@ -130,18 +145,31 @@ async function retryPendingGaps(env: Env, now: Date): Promise<void> {
     const changes = await rollupHour(env.DB, hour);
     console.log(`Gap repoll rollupHour ${hour}: ${changes} rows`);
   }
+  // Skip today: the daily table is only ever written as a complete-day
+  // aggregate at the next midnight cron. Rolling it up mid-day would publish a
+  // partial row that understates the 90d/180d bars until midnight overwrites it.
+  const today = snapToDay(now).toISOString();
   for (const day of resolvedDays) {
+    if (day === today) continue;
     const changes = await rollupDay(env.DB, day);
     console.log(`Gap repoll rollupDay ${day}: ${changes} rows`);
   }
 }
 
 async function discoverNewGaps(env: Env, windowStart: Date, windowEnd: Date, now: Date): Promise<void> {
-  const rosterSince = new Date(windowEnd.getTime() - 24 * 60 * 60 * 1000);
+  // The cron clock is never on a 5-minute boundary, but every raw ts is.
+  // Snapping both ends keeps the generated slots aligned to real rows (an
+  // unaligned start makes every slot a phantom gap) and keeps the newest
+  // scanned bucket a *complete* one the full run actually fetched.
+  const scanStart = snapToFiveMin(windowStart);
+  const scanEnd = snapToFiveMin(windowEnd);
+  if (scanEnd <= scanStart) return;
+
+  const rosterSince = new Date(scanEnd.getTime() - 24 * 60 * 60 * 1000);
   const missing = await findMissingGapCells(
-    env.DB, windowStart.toISOString(), windowEnd.toISOString(), rosterSince.toISOString(),
+    env.DB, scanStart.toISOString(), scanEnd.toISOString(), rosterSince.toISOString(),
   );
   if (missing.length === 0) return;
   await insertGapCells(env.DB, missing, now.toISOString());
-  console.log(`Gap detection: found ${missing.length} new missing cell(s) in window ${windowStart.toISOString()}-${windowEnd.toISOString()}`);
+  console.log(`Gap detection: found ${missing.length} new missing cell(s) in window ${scanStart.toISOString()}-${scanEnd.toISOString()}`);
 }

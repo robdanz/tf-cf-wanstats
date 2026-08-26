@@ -99,8 +99,13 @@ export async function findMissingGapCells(
       SELECT strftime('%Y-%m-%dT%H:%M:%SZ', ts, '+300 seconds') FROM slots
       WHERE strftime('%Y-%m-%dT%H:%M:%SZ', ts, '+300 seconds') < ?2
     ),
+    -- Two sargable halves UNIONed (same pattern as CURRENT_METRICS_SQL): a bare
+    -- ts predicate can't use idx_tm_direction_ts, and filtering to one direction
+    -- would drop tunnels whose only recent data is the other direction.
     active_tunnels AS (
-      SELECT DISTINCT tunnel_name FROM tunnel_metrics WHERE ts >= ?3
+      SELECT tunnel_name FROM tunnel_metrics WHERE direction = 'ingress' AND ts >= ?3
+      UNION
+      SELECT tunnel_name FROM tunnel_metrics WHERE direction = 'egress' AND ts >= ?3
     ),
     expected AS (
       SELECT at.tunnel_name, d.direction, s.ts
@@ -138,14 +143,26 @@ export async function insertGapCells(db: D1Database, cells: GapCell[], now: stri
   }
 }
 
-export async function getPendingGaps(db: D1Database, limit: number): Promise<TrackedGapCell[]> {
+// Caps by *distinct timestamp*, not cell count: one missing 5-min bucket can be
+// thousands of cells at scale, and a plain LIMIT would split a single bucket's
+// cells across runs for nothing — one GraphQL call returns every tunnel for a
+// bucket anyway. Oldest-first by the earliest first_detected of each timestamp.
+export async function getPendingGaps(db: D1Database, maxDistinctTimestamps: number): Promise<TrackedGapCell[]> {
   const { results } = await db.prepare(`
-    SELECT tunnel_name, direction, ts, attempts, first_detected
-    FROM gap_tracking
-    WHERE confirmed_empty_at IS NULL AND attempts < 3
-    ORDER BY first_detected ASC
-    LIMIT ?
-  `).bind(limit).all<{ tunnel_name: string; direction: string; ts: string; attempts: number; first_detected: string }>();
+    WITH candidate_ts AS (
+      SELECT ts, MIN(first_detected) AS earliest
+      FROM gap_tracking
+      WHERE confirmed_empty_at IS NULL AND attempts < 3
+      GROUP BY ts
+      ORDER BY earliest ASC
+      LIMIT ?
+    )
+    SELECT g.tunnel_name, g.direction, g.ts, g.attempts, g.first_detected
+    FROM gap_tracking g
+    JOIN candidate_ts c ON g.ts = c.ts
+    WHERE g.confirmed_empty_at IS NULL AND g.attempts < 3
+    ORDER BY g.first_detected ASC
+  `).bind(maxDistinctTimestamps).all<{ tunnel_name: string; direction: string; ts: string; attempts: number; first_detected: string }>();
 
   return results.map((r) => ({
     tunnelName: r.tunnel_name,
