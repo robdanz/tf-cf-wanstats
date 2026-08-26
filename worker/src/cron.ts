@@ -84,7 +84,7 @@ async function handleDailyTasks(env: Env, now: Date): Promise<void> {
 
   // Purge old D1 data
   const purgeResult = await purgeOldData(env.DB);
-  console.log(`D1 retention: deleted raw=${purgeResult.rawDeleted} hourly=${purgeResult.hourlyDeleted} daily=${purgeResult.dailyDeleted}`);
+  console.log(`D1 retention: deleted raw=${purgeResult.rawDeleted} hourly=${purgeResult.hourlyDeleted} daily=${purgeResult.dailyDeleted} gaps=${purgeResult.gapTrackingDeleted}`);
 
   // Purge old R2 data (>6 months)
   const r2Deleted = await purgeOldR2Data(env.RAW_METRICS);

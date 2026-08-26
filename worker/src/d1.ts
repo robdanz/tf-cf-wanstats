@@ -1,4 +1,4 @@
-import type { NormalizedRow, TunnelStat } from './types';
+import type { NormalizedRow, TunnelStat, GapCell, TrackedGapCell } from './types';
 
 const BATCH_SIZE = 100;
 
@@ -55,6 +55,7 @@ export async function purgeOldData(db: D1Database): Promise<{
   rawDeleted: number;
   hourlyDeleted: number;
   dailyDeleted: number;
+  gapTrackingDeleted: number;
 }> {
   const now = new Date();
   const rawCutoff = new Date(now);
@@ -64,17 +65,125 @@ export async function purgeOldData(db: D1Database): Promise<{
   const dailyCutoff = new Date(now);
   dailyCutoff.setUTCDate(dailyCutoff.getUTCDate() - 180);
 
-  const [rawResult, hourlyResult, dailyResult] = await Promise.all([
+  const [rawResult, hourlyResult, dailyResult, gapResult] = await Promise.all([
     db.prepare('DELETE FROM tunnel_metrics WHERE ts < ?').bind(rawCutoff.toISOString()).run(),
     db.prepare('DELETE FROM tunnel_metrics_hourly WHERE ts < ?').bind(hourlyCutoff.toISOString()).run(),
     db.prepare('DELETE FROM tunnel_metrics_daily WHERE ts < ?').bind(dailyCutoff.toISOString()).run(),
+    db.prepare('DELETE FROM gap_tracking WHERE confirmed_empty_at IS NOT NULL AND confirmed_empty_at < ?').bind(rawCutoff.toISOString()).run(),
   ]);
 
   return {
     rawDeleted: rawResult.meta.changes ?? 0,
     hourlyDeleted: hourlyResult.meta.changes ?? 0,
     dailyDeleted: dailyResult.meta.changes ?? 0,
+    gapTrackingDeleted: gapResult.meta.changes ?? 0,
   };
+}
+
+// ── Gap tracking (detect + bounded auto-repoll) ─────────────────────────────
+// See docs/superpowers/specs/2026-08-25-gap-detection-repoll-design.md.
+// A gap_tracking row exists only while a cell is unresolved: resolved cells
+// are deleted (the raw row is the record); confirmed_empty_at rows are
+// terminal and excluded from all future discovery.
+
+export async function findMissingGapCells(
+  db: D1Database,
+  windowStart: string,
+  windowEnd: string,
+  rosterSince: string,
+): Promise<GapCell[]> {
+  const { results } = await db.prepare(`
+    WITH RECURSIVE slots(ts) AS (
+      SELECT strftime('%Y-%m-%dT%H:%M:%SZ', ?1)
+      UNION ALL
+      SELECT strftime('%Y-%m-%dT%H:%M:%SZ', ts, '+300 seconds') FROM slots
+      WHERE strftime('%Y-%m-%dT%H:%M:%SZ', ts, '+300 seconds') < ?2
+    ),
+    active_tunnels AS (
+      SELECT DISTINCT tunnel_name FROM tunnel_metrics WHERE ts >= ?3
+    ),
+    expected AS (
+      SELECT at.tunnel_name, d.direction, s.ts
+      FROM active_tunnels at
+      CROSS JOIN (SELECT 'ingress' AS direction UNION ALL SELECT 'egress') d
+      CROSS JOIN slots s
+    )
+    SELECT e.tunnel_name, e.direction, e.ts
+    FROM expected e
+    LEFT JOIN tunnel_metrics m
+      ON m.tunnel_name = e.tunnel_name AND m.direction = e.direction AND m.ts = e.ts
+    LEFT JOIN gap_tracking g
+      ON g.tunnel_name = e.tunnel_name AND g.direction = e.direction AND g.ts = e.ts
+    WHERE m.ts IS NULL AND g.tunnel_name IS NULL
+  `).bind(windowStart, windowEnd, rosterSince).all<{ tunnel_name: string; direction: string; ts: string }>();
+
+  return results.map((r) => ({
+    tunnelName: r.tunnel_name,
+    direction: r.direction as 'ingress' | 'egress',
+    ts: r.ts,
+  }));
+}
+
+export async function insertGapCells(db: D1Database, cells: GapCell[], now: string): Promise<void> {
+  if (cells.length === 0) return;
+  for (let i = 0; i < cells.length; i += BATCH_SIZE) {
+    const chunk = cells.slice(i, i + BATCH_SIZE);
+    await db.batch(
+      chunk.map((c) =>
+        db.prepare(
+          'INSERT OR IGNORE INTO gap_tracking (tunnel_name, direction, ts, attempts, first_detected) VALUES (?, ?, ?, 0, ?)',
+        ).bind(c.tunnelName, c.direction, c.ts, now),
+      ),
+    );
+  }
+}
+
+export async function getPendingGaps(db: D1Database, limit: number): Promise<TrackedGapCell[]> {
+  const { results } = await db.prepare(`
+    SELECT tunnel_name, direction, ts, attempts, first_detected
+    FROM gap_tracking
+    WHERE confirmed_empty_at IS NULL AND attempts < 3
+    ORDER BY first_detected ASC
+    LIMIT ?
+  `).bind(limit).all<{ tunnel_name: string; direction: string; ts: string; attempts: number; first_detected: string }>();
+
+  return results.map((r) => ({
+    tunnelName: r.tunnel_name,
+    direction: r.direction as 'ingress' | 'egress',
+    ts: r.ts,
+    attempts: r.attempts,
+    firstDetected: r.first_detected,
+  }));
+}
+
+export async function deleteResolvedGaps(db: D1Database, cells: GapCell[]): Promise<void> {
+  if (cells.length === 0) return;
+  for (let i = 0; i < cells.length; i += BATCH_SIZE) {
+    const chunk = cells.slice(i, i + BATCH_SIZE);
+    await db.batch(
+      chunk.map((c) =>
+        db.prepare('DELETE FROM gap_tracking WHERE tunnel_name = ? AND direction = ? AND ts = ?')
+          .bind(c.tunnelName, c.direction, c.ts),
+      ),
+    );
+  }
+}
+
+export async function incrementOrConfirmGaps(db: D1Database, cells: GapCell[], now: string): Promise<void> {
+  if (cells.length === 0) return;
+  for (let i = 0; i < cells.length; i += BATCH_SIZE) {
+    const chunk = cells.slice(i, i + BATCH_SIZE);
+    await db.batch(
+      chunk.map((c) =>
+        db.prepare(`
+          UPDATE gap_tracking
+          SET attempts = attempts + 1,
+              confirmed_empty_at = CASE WHEN attempts + 1 >= 3 THEN ? ELSE NULL END
+          WHERE tunnel_name = ? AND direction = ? AND ts = ?
+        `).bind(now, c.tunnelName, c.direction, c.ts),
+      ),
+    );
+  }
 }
 
 // ── Current-window bulk query (/api/current) ────────────────────────────────

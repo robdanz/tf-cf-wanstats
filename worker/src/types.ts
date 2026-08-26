@@ -42,6 +42,17 @@ export interface GraphQLResponse {
 
 export type NormalizedRow = { tunnelName: string; ts: string; bitRate: number };
 
+export interface GapCell {
+  tunnelName: string;
+  direction: 'ingress' | 'egress';
+  ts: string;
+}
+
+export interface TrackedGapCell extends GapCell {
+  attempts: number;
+  firstDetected: string;
+}
+
 export interface TunnelStat {
   tunnel_name: string;
   p95_ingress_bps: number | null;
