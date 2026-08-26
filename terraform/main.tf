@@ -90,10 +90,27 @@ resource "null_resource" "migrate_0002" {
   }
 }
 
+resource "null_resource" "migrate_0003" {
+  depends_on = [null_resource.migrate_0002, local_file.wrangler_jsonc]
+
+  triggers = {
+    migration_hash = filesha256("${path.module}/../migrations/0003_gap_tracking.sql")
+    database_id    = cloudflare_d1_database.metrics.id
+  }
+
+  provisioner "local-exec" {
+    working_dir = "${path.module}/../worker"
+    command     = "npx wrangler d1 execute tf-cf-wanstats-metrics --remote --file=${abspath(path.module)}/../migrations/0003_gap_tracking.sql"
+    environment = {
+      CLOUDFLARE_API_TOKEN = var.cloudflare_api_token
+    }
+  }
+}
+
 # ── Deploy Worker ──────────────────────────────────────────────────────────────
 
 resource "null_resource" "deploy" {
-  depends_on = [null_resource.migrate, null_resource.migrate_0002]
+  depends_on = [null_resource.migrate, null_resource.migrate_0002, null_resource.migrate_0003]
 
   triggers = {
     # Hash all source files so any change triggers redeploy
