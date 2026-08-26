@@ -3,6 +3,7 @@ import { fetchMetricsTimeSliced } from './graphql';
 import { storeTunnelMetrics, rollupHour, rollupDay, purgeOldData, setMetadata, storeBillingP95 } from './d1';
 import { writeRawToR2, computeAggregateBillingP95, purgeOldR2Data } from './r2';
 import { snapToHour, snapToDay, toPeriod } from './utils';
+import { runGapCheck } from './gaps';
 
 export async function handleCron(env: Env): Promise<void> {
   const now = new Date();
@@ -67,6 +68,10 @@ export async function handleCron(env: Env): Promise<void> {
   const completedHour = snapToHour(new Date(now.getTime() - 2 * 60 * 60 * 1000));
   const rollupChanges = await rollupHour(env.DB, completedHour.toISOString());
   console.log(`Hourly rollup for ${completedHour.toISOString()}: ${rollupChanges} rows`);
+
+  // Step 3.5: gap detection + bounded auto-repoll — retries previously-tracked
+  // pending cells first, then scans this run's window for new misses.
+  await runGapCheck(env, windowStart, now);
 
   // Step 4: Daily tasks at hour 0 UTC
   if (now.getUTCHours() === 0) {

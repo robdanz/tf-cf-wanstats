@@ -121,6 +121,7 @@ resource "null_resource" "deploy" {
       filesha256("${path.module}/../worker/src/d1.ts"),
       filesha256("${path.module}/../worker/src/r2.ts"),
       filesha256("${path.module}/../worker/src/cron.ts"),
+      filesha256("${path.module}/../worker/src/gaps.ts"),
       filesha256("${path.module}/../worker/src/api.ts"),
       filesha256("${path.module}/../worker/src/dashboard.ts"),
       filesha256("${path.module}/../worker/src/utils.ts"),
