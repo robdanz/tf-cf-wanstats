@@ -1,25 +1,65 @@
 import type { Env } from './types';
 import { fetchMetricsTimeSliced } from './graphql';
-import { storeTunnelMetrics, rollupHour, rollupDay, purgeOldData, setMetadata, storeBillingP95 } from './d1';
+import { storeTunnelMetrics, purgeOldData, setMetadata, storeBillingP95, recordCronError } from './d1';
 import { writeRawToR2, computeAggregateBillingP95, purgeOldR2Data } from './r2';
-import { snapToHour, snapToDay, toPeriod } from './utils';
+import { toPeriod } from './utils';
 import { retryPendingGaps } from './gaps';
+import { reconcileHours } from './reconcile';
 
-export async function handleCron(env: Env): Promise<void> {
-  const now = new Date();
-  // Cron fires every 5 minutes. The minute-0 slot is the authoritative full
-  // run (65-min lookback, R2 write, rollups, daily tasks); the other slots
-  // are light runs that only refresh recent raw data in D1. The 20-min light
-  // lookback covers Analytics API data latency; INSERT OR REPLACE lets
-  // late-arriving buckets settle on subsequent runs.
+// Cron fires every 5 minutes. The minute-0 slot is the full run (65-min
+// lookback, R2 write, pending-gap retry, hour ledger, midnight tasks); the
+// other slots are light runs that only refresh recent raw data in D1.
+//
+// Every full-run step runs under its own try/catch and records its failure
+// in cron_metadata (last_error_*). A failure in one step never skips the
+// steps after it, and the ledger repairs whatever a dead step left behind.
+export async function handleCron(env: Env, now: Date = new Date()): Promise<void> {
   const fullRun = now.getUTCMinutes() < 5;
   const lookbackMinutes = fullRun ? 65 : 20;
   const windowStart = new Date(now.getTime() - lookbackMinutes * 60 * 1000);
 
   console.log(`Cron run: ${fullRun ? 'full' : 'light'} (lookback ${lookbackMinutes}m)`);
+  if (fullRun) await setMetadata(env.DB, 'last_full_run_at', now.toISOString());
 
-  // Step 1: Fetch via time-sliced GraphQL
-  const { ingress, egress, warnings } = await fetchMetricsTimeSliced(
+  let ok = true;
+
+  try {
+    await collect(env, now, windowStart, fullRun);
+  } catch (err) {
+    ok = false;
+    await recordCronError(env.DB, 'collect', err);
+  }
+
+  if (!fullRun) return;
+
+  try {
+    await retryPendingGaps(env, now);
+  } catch (err) {
+    ok = false;
+    await recordCronError(env.DB, 'retry', err);
+  }
+
+  try {
+    await reconcileHours(env, now);
+  } catch (err) {
+    ok = false;
+    await recordCronError(env.DB, 'reconcile', err);
+  }
+
+  if (now.getUTCHours() === 0) {
+    try {
+      await handleDailyTasks(env, now);
+    } catch (err) {
+      ok = false;
+      await recordCronError(env.DB, 'daily', err);
+    }
+  }
+
+  await setMetadata(env.DB, 'last_full_run_ok', ok ? 'true' : 'false');
+}
+
+async function collect(env: Env, now: Date, windowStart: Date, fullRun: boolean): Promise<void> {
+  const { ingress, egress, warnings, failedSlices, sliceCount } = await fetchMetricsTimeSliced(
     env.ACCOUNT_ID,
     env.WAN_API_TOKEN,
     windowStart,
@@ -41,9 +81,11 @@ export async function handleCron(env: Env): Promise<void> {
     console.warn(`CAPACITY WARNING: ${tunnelNames.size} tunnels detected. GraphQL limit may need increasing.`);
   }
 
+  if (sliceCount > 0 && failedSlices.length === sliceCount) {
+    throw new Error(`all ${sliceCount} slice(s) failed: ${warnings[warnings.length - 1] ?? 'no detail'}`);
+  }
+
   if (!fullRun) {
-    // Light run: D1 only. R2, rollups, and retention stay on the full run so
-    // hourly CSV objects and billing p95 remain byte-identical to before.
     await Promise.all([
       storeTunnelMetrics(env.DB, ingress, 'ingress'),
       storeTunnelMetrics(env.DB, egress, 'egress'),
@@ -52,7 +94,6 @@ export async function handleCron(env: Env): Promise<void> {
     return;
   }
 
-  // Step 2: Dual-write D1 + R2
   const [, r2Result] = await Promise.all([
     Promise.all([
       storeTunnelMetrics(env.DB, ingress, 'ingress'),
@@ -63,44 +104,19 @@ export async function handleCron(env: Env): Promise<void> {
 
   console.log(`D1: stored ${ingress.length} ingress + ${egress.length} egress rows`);
   console.log(`R2: wrote ${r2Result.filesWritten} files, ${r2Result.totalRows} total rows`);
-
-  // Step 3: Hourly rollup (2 hours ago is safe — data is settled)
-  const completedHour = snapToHour(new Date(now.getTime() - 2 * 60 * 60 * 1000));
-  const rollupChanges = await rollupHour(env.DB, completedHour.toISOString());
-  console.log(`Hourly rollup for ${completedHour.toISOString()}: ${rollupChanges} rows`);
-
-  // Step 3.5: gap detection + bounded auto-repoll — retries previously-tracked
-  // pending cells first, then scans this run's window for new misses. Wrapped
-  // so a failure here can never skip the daily tasks below.
-  try {
-    await retryPendingGaps(env, now);
-  } catch (err) {
-    console.error('Gap check failed:', err instanceof Error ? err.message : String(err));
-  }
-
-  // Step 4: Daily tasks at hour 0 UTC
-  if (now.getUTCHours() === 0) {
-    await handleDailyTasks(env, now);
-  }
 }
 
+// Retention and billing only. Hourly and daily rollups live in the ledger
+// (reconcile.ts) so the midnight run is no longer a single point of failure.
 async function handleDailyTasks(env: Env, now: Date): Promise<void> {
   console.log('Running daily tasks...');
 
-  // Roll up previous day
-  const yesterday = snapToDay(new Date(now.getTime() - 24 * 60 * 60 * 1000));
-  const dayRollupChanges = await rollupDay(env.DB, yesterday.toISOString());
-  console.log(`Daily rollup for ${yesterday.toISOString()}: ${dayRollupChanges} rows`);
-
-  // Purge old D1 data
   const purgeResult = await purgeOldData(env.DB);
   console.log(`D1 retention: deleted raw=${purgeResult.rawDeleted} hourly=${purgeResult.hourlyDeleted} daily=${purgeResult.dailyDeleted} gaps=${purgeResult.gapTrackingDeleted}`);
 
-  // Purge old R2 data (>6 months)
   const r2Deleted = await purgeOldR2Data(env.RAW_METRICS);
   console.log(`R2 retention: deleted ${r2Deleted} files`);
 
-  // Compute billing p95 for current and previous calendar month
   await computeAndStoreBillingP95(env, now);
 }
 
