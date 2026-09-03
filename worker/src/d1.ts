@@ -512,15 +512,22 @@ export async function setMetadata(db: D1Database, key: string, value: string): P
 
 const MAX_ERROR_MESSAGE_CHARS = 500;
 
+// Never throws — this runs inside the cron's own catch blocks, and a failure
+// here must not abort handleCron or skip the steps that follow it.
 export async function recordCronError(db: D1Database, step: CronStep, err: unknown): Promise<void> {
   const message = (err instanceof Error ? err.message : String(err)).slice(0, MAX_ERROR_MESSAGE_CHARS);
   console.error(`Cron step ${step} failed: ${message}`);
   const upsert = 'INSERT OR REPLACE INTO cron_metadata (key, value) VALUES (?, ?)';
-  await db.batch([
-    db.prepare(upsert).bind('last_error_at', new Date().toISOString()),
-    db.prepare(upsert).bind('last_error_step', step),
-    db.prepare(upsert).bind('last_error_message', message),
-  ]);
+  try {
+    await db.batch([
+      db.prepare(upsert).bind('last_error_at', new Date().toISOString()),
+      db.prepare(upsert).bind('last_error_step', step),
+      db.prepare(upsert).bind('last_error_message', message),
+    ]);
+  } catch (writeErr) {
+    const writeMessage = writeErr instanceof Error ? writeErr.message : String(writeErr);
+    console.error(`Failed to record cron error for step ${step}: ${writeMessage}`);
+  }
 }
 
 // ── Billing p95 storage ─────────────────────────────────────────────────────

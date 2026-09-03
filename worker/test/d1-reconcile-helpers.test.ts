@@ -49,4 +49,12 @@ describe('recordCronError', () => {
     await recordCronError(DB, 'daily', 'plain string');
     expect(await getMetadata(DB, 'last_error_message')).toBe('plain string');
   });
+
+  it('never throws, even when the write itself fails', async () => {
+    await DB.exec('DROP TABLE cron_metadata');
+
+    await expect(recordCronError(DB, 'collect', new Error('boom'))).resolves.toBeUndefined();
+
+    await applyTestSchema(DB);
+  });
 });
