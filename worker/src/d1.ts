@@ -240,6 +240,56 @@ export async function incrementOrConfirmGaps(db: D1Database, cells: GapCell[], n
   }
 }
 
+export interface GapCellRow {
+  tunnel_name: string;
+  direction: string;
+  ts: string;
+  attempts: number;
+  first_detected: string;
+  confirmed_empty_at: string | null;
+}
+
+// Range predicate on ts uses idx_gap_ts; the optional filters are applied
+// after the index range. Bounds are raw ts format.
+export async function getGapCells(
+  db: D1Database,
+  start: string,
+  end: string,
+  tunnel: string | null,
+  status: 'pending' | 'confirmed_empty' | null,
+  limit: number,
+): Promise<GapCellRow[]> {
+  const statusClause = status === 'pending'
+    ? 'AND confirmed_empty_at IS NULL'
+    : status === 'confirmed_empty'
+      ? 'AND confirmed_empty_at IS NOT NULL'
+      : '';
+  const tunnelClause = tunnel !== null ? 'AND tunnel_name = ?3' : '';
+  const sql = `
+    SELECT tunnel_name, direction, ts, attempts, first_detected, confirmed_empty_at
+    FROM gap_tracking
+    WHERE ts >= ?1 AND ts < ?2 ${tunnelClause} ${statusClause}
+    ORDER BY ts, tunnel_name, direction
+    LIMIT ?4
+  `;
+  const stmt = db.prepare(sql);
+  const bound = tunnel !== null ? stmt.bind(start, end, tunnel, limit) : stmt.bind(start, end, null, limit);
+  const { results } = await bound.all<GapCellRow>();
+  return results;
+}
+
+// Both predicates lead idx_gap_pending (confirmed_empty_at, ...).
+export async function getGapCounts(
+  db: D1Database,
+  confirmedSince: string,
+): Promise<{ pending: number; confirmedEmpty: number }> {
+  const [p, c] = await Promise.all([
+    db.prepare('SELECT COUNT(*) AS n FROM gap_tracking WHERE confirmed_empty_at IS NULL').first<{ n: number }>(),
+    db.prepare('SELECT COUNT(*) AS n FROM gap_tracking WHERE confirmed_empty_at >= ?').bind(confirmedSince).first<{ n: number }>(),
+  ]);
+  return { pending: p?.n ?? 0, confirmedEmpty: c?.n ?? 0 };
+}
+
 // ── Current-window bulk query (/api/current) ────────────────────────────────
 // Bind: ?1 = since, in raw ts format 'YYYY-MM-DDTHH:MM:SSZ'.
 // Per-direction predicates keep idx_tm_direction_ts (direction, ts) in play;

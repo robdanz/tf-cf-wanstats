@@ -9,6 +9,9 @@ import {
   getBillingP95Summary,
   getBillingP95Tunnels,
   storeTunnelMetrics,
+  getGapCells,
+  getGapCounts,
+  getMetadata,
   CURRENT_METRICS_SQL,
   CHANGED_SINCE_SQL,
   CHANGED_SINCE_GROUP_SQL,
@@ -28,6 +31,9 @@ const VALID_SORT_DIRS = new Set(['ASC', 'DESC']);
 
 const CHANGED_SINCE_MAX_ROWS = 20000;
 const CHANGED_SINCE_LAG_MS = 60 * 1000;
+
+const GAPS_MAX_ROWS = 50000;
+const GAPS_MAX_SPAN_MS = 7 * 24 * 60 * 60 * 1000;
 
 export async function handleApiRequest(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
@@ -261,6 +267,85 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
         'Content-Disposition': `attachment; filename="${filename}"`,
       },
     });
+  }
+
+  if (pathname === '/api/gaps') {
+    const startParam = url.searchParams.get('start');
+    const endParam = url.searchParams.get('end');
+    if (!startParam || !endParam || isNaN(Date.parse(startParam)) || isNaN(Date.parse(endParam))) {
+      return new Response('Missing or invalid start/end — use ISO 8601', { status: 400 });
+    }
+    const startDate = new Date(startParam);
+    const endDate = new Date(endParam);
+    if (endDate.getTime() - startDate.getTime() > GAPS_MAX_SPAN_MS) {
+      return new Response('Range exceeds 7 days', { status: 400 });
+    }
+    const statusParam = url.searchParams.get('status');
+    if (statusParam !== null && statusParam !== 'pending' && statusParam !== 'confirmed_empty') {
+      return new Response('status must be pending or confirmed_empty', { status: 400 });
+    }
+    const tunnel = url.searchParams.get('tunnel');
+
+    // Raw ts format bounds (no milliseconds).
+    const start = startDate.toISOString().slice(0, 19) + 'Z';
+    const end = endDate.toISOString().slice(0, 19) + 'Z';
+    const cells = await getGapCells(env.DB, start, end, tunnel, statusParam, GAPS_MAX_ROWS + 1);
+    const truncated = cells.length > GAPS_MAX_ROWS;
+    const page = truncated ? cells.slice(0, GAPS_MAX_ROWS) : cells;
+
+    let pending = 0;
+    let confirmedEmpty = 0;
+    for (const c of page) {
+      if (c.confirmed_empty_at === null) pending++; else confirmedEmpty++;
+    }
+
+    return Response.json({
+      start, end, pending, confirmed_empty: confirmedEmpty, truncated,
+      cells: page.map((c) => ({
+        tunnel_name: c.tunnel_name,
+        direction: c.direction,
+        ts: c.ts,
+        status: c.confirmed_empty_at === null ? 'pending' : 'confirmed_empty',
+        attempts: c.attempts,
+        first_detected: c.first_detected,
+        confirmed_empty_at: c.confirmed_empty_at,
+      })),
+    }, { headers: { 'Cache-Control': 'no-store' } });
+  }
+
+  if (pathname === '/api/health') {
+    const now = new Date();
+    const keys = [
+      'last_cron_run', 'last_tunnel_count', 'last_full_run_at', 'last_full_run_ok',
+      'reconciled_through', 'last_error_at', 'last_error_step', 'last_error_message',
+    ] as const;
+    const values = await Promise.all(keys.map((k) => getMetadata(env.DB, k)));
+    const meta = Object.fromEntries(keys.map((k, i) => [k, values[i]])) as Record<typeof keys[number], string | null>;
+
+    const reconciledThrough = meta.reconciled_through;
+    const hoursBehind = reconciledThrough === null
+      ? null
+      : Math.max(0, Math.floor((now.getTime() - 2 * 60 * 60 * 1000 - new Date(reconciledThrough).getTime()) / (60 * 60 * 1000)));
+
+    const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString();
+    const counts = await getGapCounts(env.DB, sevenDaysAgo);
+
+    return Response.json({
+      generated_at: now.toISOString(),
+      last_cron_run: meta.last_cron_run,
+      last_tunnel_count: meta.last_tunnel_count === null ? null : parseInt(meta.last_tunnel_count, 10),
+      last_full_run_at: meta.last_full_run_at,
+      last_full_run_ok: meta.last_full_run_ok === null ? null : meta.last_full_run_ok === 'true',
+      reconciled_through: reconciledThrough,
+      hours_behind: hoursBehind,
+      pending_gaps: counts.pending,
+      confirmed_empty_7d: counts.confirmedEmpty,
+      last_error: meta.last_error_at === null ? null : {
+        at: meta.last_error_at,
+        step: meta.last_error_step,
+        message: meta.last_error_message,
+      },
+    }, { headers: { 'Cache-Control': 'no-store' } });
   }
 
   if (pathname === '/api/current') {
