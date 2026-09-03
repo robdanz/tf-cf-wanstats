@@ -54,10 +54,12 @@ describe('/api/gaps', () => {
     expect(byStatus.cells.filter((c) => c.tunnel_name.startsWith('GAP_')).map((c) => c.tunnel_name)).toEqual(['GAP_P']);
   });
 
-  it('rejects a missing range, a bad status, and a span over 7 days', async () => {
+  it('rejects a missing range, a bad status, a span over 7 days, and end <= start', async () => {
     expect((await get('/api/gaps')).status).toBe(400);
     expect((await get('/api/gaps?start=2026-09-01T00:00:00Z&end=2026-09-02T00:00:00Z&status=nope')).status).toBe(400);
     expect((await get('/api/gaps?start=2026-09-01T00:00:00Z&end=2026-09-09T00:00:01Z')).status).toBe(400);
+    expect((await get('/api/gaps?start=2026-09-01T00:00:00Z&end=2026-09-01T00:00:00Z')).status).toBe(400);
+    expect((await get('/api/gaps?start=2026-09-01T00:00:00Z&end=2026-08-31T00:00:00Z')).status).toBe(400);
   });
 });
 

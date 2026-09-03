@@ -11,6 +11,7 @@ import {
   storeTunnelMetrics,
   getGapCells,
   getGapCounts,
+  getGapRangeCounts,
   getMetadata,
   CURRENT_METRICS_SQL,
   CHANGED_SINCE_SQL,
@@ -277,6 +278,9 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
     }
     const startDate = new Date(startParam);
     const endDate = new Date(endParam);
+    if (endDate.getTime() <= startDate.getTime()) {
+      return new Response('end must be after start', { status: 400 });
+    }
     if (endDate.getTime() - startDate.getTime() > GAPS_MAX_SPAN_MS) {
       return new Response('Range exceeds 7 days', { status: 400 });
     }
@@ -293,11 +297,9 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
     const truncated = cells.length > GAPS_MAX_ROWS;
     const page = truncated ? cells.slice(0, GAPS_MAX_ROWS) : cells;
 
-    let pending = 0;
-    let confirmedEmpty = 0;
-    for (const c of page) {
-      if (c.confirmed_empty_at === null) pending++; else confirmedEmpty++;
-    }
+    // Range totals, not page-local counts: the status filter narrows the
+    // returned cells but must not change what pending/confirmed_empty report.
+    const { pending, confirmedEmpty } = await getGapRangeCounts(env.DB, start, end, tunnel);
 
     return Response.json({
       start, end, pending, confirmed_empty: confirmedEmpty, truncated,

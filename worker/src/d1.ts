@@ -302,6 +302,27 @@ export async function getGapCounts(
   return { pending: p?.n ?? 0, confirmedEmpty: c?.n ?? 0 };
 }
 
+// Range totals for /api/gaps — the page (LIMIT-bounded) is not a valid source
+// for pending/confirmed_empty counts, since a truncated or filtered page
+// undercounts. Same optional-tunnel bind trick as getGapCells: bind null for
+// ?3 when tunnel is absent so one prepared statement covers both cases.
+export async function getGapRangeCounts(
+  db: D1Database,
+  start: string,
+  end: string,
+  tunnel: string | null,
+): Promise<{ pending: number; confirmedEmpty: number }> {
+  const tunnelClause = tunnel !== null ? 'AND tunnel_name = ?3' : '';
+  const pendingSql = `SELECT COUNT(*) AS n FROM gap_tracking WHERE ts >= ?1 AND ts < ?2 ${tunnelClause} AND confirmed_empty_at IS NULL`;
+  const confirmedSql = `SELECT COUNT(*) AS n FROM gap_tracking WHERE ts >= ?1 AND ts < ?2 ${tunnelClause} AND confirmed_empty_at IS NOT NULL`;
+  const bindArgs = tunnel !== null ? [start, end, tunnel] : [start, end];
+  const [p, c] = await Promise.all([
+    db.prepare(pendingSql).bind(...bindArgs).first<{ n: number }>(),
+    db.prepare(confirmedSql).bind(...bindArgs).first<{ n: number }>(),
+  ]);
+  return { pending: p?.n ?? 0, confirmedEmpty: c?.n ?? 0 };
+}
+
 // ── Current-window bulk query (/api/current) ────────────────────────────────
 // Bind: ?1 = since, in raw ts format 'YYYY-MM-DDTHH:MM:SSZ'.
 // Per-direction predicates keep idx_tm_direction_ts (direction, ts) in play;
