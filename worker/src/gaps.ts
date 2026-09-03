@@ -1,12 +1,11 @@
 import type { Env, GapCell, TrackedGapCell, NormalizedRow } from './types';
 import { fetchMetricsTimeSliced } from './graphql';
 import {
-  findMissingGapCells, insertGapCells, getPendingGaps,
-  deleteResolvedGaps, incrementOrConfirmGaps, storeTunnelMetrics,
+  getPendingGaps, deleteResolvedGaps, incrementOrConfirmGaps, storeTunnelMetrics,
   rollupHour, rollupDay,
 } from './d1';
 import { writeRawToR2 } from './r2';
-import { snapToFiveMin, snapToHour, snapToDay } from './utils';
+import { snapToHour, snapToDay } from './utils';
 
 // Budget per cron run, counted in 5-minute buckets: fetchMetricsTimeSliced
 // issues one sequential GraphQL request per bucket, so ranges (which can span
@@ -65,13 +64,7 @@ function finalizeRange(tsList: string[], byTs: Map<string, TrackedGapCell[]>): C
   return { start, end, cells };
 }
 
-export async function runGapCheck(env: Env, windowStart: Date, windowEnd: Date): Promise<void> {
-  const now = new Date();
-  await retryPendingGaps(env, now);
-  await discoverNewGaps(env, windowStart, windowEnd, now);
-}
-
-async function retryPendingGaps(env: Env, now: Date): Promise<void> {
+export async function retryPendingGaps(env: Env, now: Date): Promise<void> {
   const pending = await getPendingGaps(env.DB, MAX_PENDING_TIMESTAMPS);
   if (pending.length === 0) return;
 
@@ -97,14 +90,18 @@ async function retryPendingGaps(env: Env, now: Date): Promise<void> {
   for (const range of toProcess) {
     let ingress: NormalizedRow[];
     let egress: NormalizedRow[];
+    let failedSlices: string[];
     try {
-      ({ ingress, egress } = await fetchMetricsTimeSliced(
+      ({ ingress, egress, failedSlices } = await fetchMetricsTimeSliced(
         env.ACCOUNT_ID, env.WAN_API_TOKEN, new Date(range.start), new Date(range.end),
       ));
     } catch (err) {
       console.warn(`Gap repoll fetch failed for ${range.start}-${range.end}: ${err instanceof Error ? err.message : String(err)}`);
       continue;
     }
+    // failedSlices carries toISOString() timestamps; raw ts has no
+    // milliseconds. Normalise once so the per-cell check is a plain lookup.
+    const failedTs = new Set(failedSlices.map((s) => s.replace('.000Z', 'Z')));
 
     await Promise.all([
       storeTunnelMetrics(env.DB, ingress, 'ingress'),
@@ -124,7 +121,10 @@ async function retryPendingGaps(env: Env, now: Date): Promise<void> {
 
     const resolved: GapCell[] = [];
     const stillMissing: GapCell[] = [];
+    let skipped = 0;
     for (const cell of range.cells) {
+      // A failed slice says nothing about the cell: no resolve, no attempt burned.
+      if (failedTs.has(cell.ts)) { skipped++; continue; }
       const key = `${cell.tunnelName}|${cell.direction}`;
       if (present.get(cell.ts)?.has(key)) {
         resolved.push(cell);
@@ -138,7 +138,7 @@ async function retryPendingGaps(env: Env, now: Date): Promise<void> {
     if (resolved.length > 0) await deleteResolvedGaps(env.DB, resolved);
     if (stillMissing.length > 0) await incrementOrConfirmGaps(env.DB, stillMissing, now.toISOString());
 
-    console.log(`Gap repoll ${range.start}-${range.end}: resolved ${resolved.length}, still missing ${stillMissing.length}`);
+    console.log(`Gap repoll ${range.start}-${range.end}: resolved ${resolved.length}, still missing ${stillMissing.length}, skipped (slice failed) ${skipped}`);
   }
 
   for (const hour of resolvedHours) {
@@ -146,30 +146,12 @@ async function retryPendingGaps(env: Env, now: Date): Promise<void> {
     console.log(`Gap repoll rollupHour ${hour}: ${changes} rows`);
   }
   // Skip today: the daily table is only ever written as a complete-day
-  // aggregate at the next midnight cron. Rolling it up mid-day would publish a
-  // partial row that understates the 90d/180d bars until midnight overwrites it.
+  // aggregate. Rolling it up mid-day would publish a partial row that
+  // understates the 90d/180d bars until the ledger rewrites it.
   const today = snapToDay(now).toISOString();
   for (const day of resolvedDays) {
     if (day === today) continue;
     const changes = await rollupDay(env.DB, day);
     console.log(`Gap repoll rollupDay ${day}: ${changes} rows`);
   }
-}
-
-async function discoverNewGaps(env: Env, windowStart: Date, windowEnd: Date, now: Date): Promise<void> {
-  // The cron clock is never on a 5-minute boundary, but every raw ts is.
-  // Snapping both ends keeps the generated slots aligned to real rows (an
-  // unaligned start makes every slot a phantom gap) and keeps the newest
-  // scanned bucket a *complete* one the full run actually fetched.
-  const scanStart = snapToFiveMin(windowStart);
-  const scanEnd = snapToFiveMin(windowEnd);
-  if (scanEnd <= scanStart) return;
-
-  const rosterSince = new Date(scanEnd.getTime() - 24 * 60 * 60 * 1000);
-  const missing = await findMissingGapCells(
-    env.DB, scanStart.toISOString(), scanEnd.toISOString(), rosterSince.toISOString(),
-  );
-  if (missing.length === 0) return;
-  await insertGapCells(env.DB, missing, now.toISOString());
-  console.log(`Gap detection: found ${missing.length} new missing cell(s) in window ${scanStart.toISOString()}-${scanEnd.toISOString()}`);
 }

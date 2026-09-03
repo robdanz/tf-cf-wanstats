@@ -3,7 +3,7 @@ import { fetchMetricsTimeSliced } from './graphql';
 import { storeTunnelMetrics, rollupHour, rollupDay, purgeOldData, setMetadata, storeBillingP95 } from './d1';
 import { writeRawToR2, computeAggregateBillingP95, purgeOldR2Data } from './r2';
 import { snapToHour, snapToDay, toPeriod } from './utils';
-import { runGapCheck } from './gaps';
+import { retryPendingGaps } from './gaps';
 
 export async function handleCron(env: Env): Promise<void> {
   const now = new Date();
@@ -73,7 +73,7 @@ export async function handleCron(env: Env): Promise<void> {
   // pending cells first, then scans this run's window for new misses. Wrapped
   // so a failure here can never skip the daily tasks below.
   try {
-    await runGapCheck(env, windowStart, now);
+    await retryPendingGaps(env, now);
   } catch (err) {
     console.error('Gap check failed:', err instanceof Error ? err.message : String(err));
   }

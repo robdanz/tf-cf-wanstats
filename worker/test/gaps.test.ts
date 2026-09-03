@@ -37,8 +37,8 @@ describe('groupIntoContiguousRanges', () => {
 
 import { vi, afterEach } from 'vitest';
 import { env } from 'cloudflare:workers';
-import { runGapCheck } from '../src/gaps';
-import { insertGapCells, getPendingGaps, storeTunnelMetrics, deleteResolvedGaps } from '../src/d1';
+import { retryPendingGaps } from '../src/gaps';
+import { insertGapCells, getPendingGaps, deleteResolvedGaps } from '../src/d1';
 import { applyTestSchema } from './helpers/schema';
 
 const DB = (env as { DB: D1Database }).DB;
@@ -73,9 +73,7 @@ describe('runGapCheck retry phase', () => {
 
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(graphqlResponse([{ name: 'TUN_RETRY', ts, rate: 4242 }])));
 
-    // windowStart/windowEnd chosen far from 2026-08-01 so the discover phase's
-    // 24h roster can't pick up TUN_RETRY and repoll it a second time.
-    await runGapCheck(TEST_ENV, new Date('2027-01-01T00:00:00Z'), new Date('2027-01-01T00:00:00Z'));
+    await retryPendingGaps(TEST_ENV, new Date('2027-01-01T00:00:00Z'));
 
     expect((await getPendingGaps(DB, 100)).find((p) => p.tunnelName === 'TUN_RETRY')).toBeUndefined();
 
@@ -92,55 +90,40 @@ describe('runGapCheck retry phase', () => {
 
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('server error', { status: 500, headers: { 'Retry-After': '0' } })));
 
-    await runGapCheck(TEST_ENV, new Date('2027-01-02T00:00:00Z'), new Date('2027-01-02T00:00:00Z'));
+    await retryPendingGaps(TEST_ENV, new Date('2027-01-02T00:00:00Z'));
 
     const row = (await getPendingGaps(DB, 100)).find((p) => p.tunnelName === 'TUN_FAIL');
     expect(row?.attempts).toBe(0);
 
     await deleteResolvedGaps(DB, [{ tunnelName: 'TUN_FAIL', direction: 'egress', ts }]); // avoid leaking into later tests
   });
-});
 
-describe('runGapCheck discover phase', () => {
-  it('tracks a new missing cell found in the scan window at attempts=0 (not repolled the same run)', async () => {
+  it('leaves a cell untouched when its slice failed but the neighbouring slice succeeded', async () => {
     await applyTestSchema(DB);
-    await storeTunnelMetrics(DB, [{ tunnelName: 'TUN_NEW', ts: '2026-08-03T09:55:00Z', bitRate: 1 }], 'ingress');
+    const okTs = '2026-08-05T10:00:00Z';
+    const failTs = '2026-08-05T10:05:00Z';
+    await insertGapCells(DB, [
+      { tunnelName: 'TUN_MIXED', direction: 'ingress', ts: okTs },
+      { tunnelName: 'TUN_MIXED', direction: 'ingress', ts: failTs },
+    ], '2026-08-05T11:00:00Z');
 
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(graphqlResponse([])));
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(init.body as string) as { variables: { datetimeStart: string } };
+      if (body.variables.datetimeStart === '2026-08-05T10:05:00.000Z') {
+        return new Response('boom', { status: 500, headers: { 'Retry-After': '0' } });
+      }
+      return graphqlResponse([]); // slice fetched fine, tunnel still absent
+    }));
 
-    await runGapCheck(TEST_ENV, new Date('2026-08-03T10:00:00Z'), new Date('2026-08-03T10:05:00Z'));
-
-    const row = (await getPendingGaps(DB, 100)).find((p) => p.tunnelName === 'TUN_NEW');
-    expect(row).toBeDefined();
-    expect(row?.attempts).toBe(0);
-
-    await deleteResolvedGaps(DB, [{ tunnelName: 'TUN_NEW', direction: 'ingress', ts: '2026-08-03T10:00:00Z' }]); // avoid leaking into later tests
-    await deleteResolvedGaps(DB, [{ tunnelName: 'TUN_NEW', direction: 'egress', ts: '2026-08-03T10:00:00Z' }]);
-  });
-
-  it('does not report phantom gaps when the cron window is not 5-minute-aligned', async () => {
-    await applyTestSchema(DB);
-    // A fully-populated window: TUN_ALIGNED has both directions for every
-    // 5-minute bucket from 08:55:00Z through 10:00:00Z inclusive. Raw rows use
-    // the GraphQL ts format ('YYYY-MM-DDTHH:MM:SSZ', no milliseconds).
-    const rows = [];
-    for (let m = 0; m < 70; m += 5) {
-      const ts = new Date(new Date('2026-08-04T08:55:00Z').getTime() + m * 60 * 1000)
-        .toISOString().replace('.000Z', 'Z');
-      rows.push({ tunnelName: 'TUN_ALIGNED', ts, bitRate: 1 });
-    }
-    await storeTunnelMetrics(DB, rows, 'ingress');
-    await storeTunnelMetrics(DB, rows, 'egress');
-
-    vi.stubGlobal('fetch', vi.fn(() => { throw new Error('must not be called — no gaps expected'); }));
-
-    // Cron-shaped, unaligned wall-clock args (real invocations are never
-    // exactly on a 5-min boundary): now = 10:00:04.512Z, windowStart = 65min back.
-    const now = new Date('2026-08-04T10:00:04.512Z');
-    const windowStart = new Date(now.getTime() - 65 * 60 * 1000);
-    await runGapCheck(TEST_ENV, windowStart, now);
+    await retryPendingGaps(TEST_ENV, new Date('2027-01-03T00:00:00Z'));
 
     const pending = await getPendingGaps(DB, 100);
-    expect(pending.filter((p) => p.tunnelName === 'TUN_ALIGNED')).toHaveLength(0);
+    expect(pending.find((p) => p.tunnelName === 'TUN_MIXED' && p.ts === okTs)?.attempts).toBe(1);
+    expect(pending.find((p) => p.tunnelName === 'TUN_MIXED' && p.ts === failTs)?.attempts).toBe(0);
+
+    await deleteResolvedGaps(DB, [
+      { tunnelName: 'TUN_MIXED', direction: 'ingress', ts: okTs },
+      { tunnelName: 'TUN_MIXED', direction: 'ingress', ts: failTs },
+    ]);
   });
 });
