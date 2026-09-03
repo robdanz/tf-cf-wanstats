@@ -66,3 +66,5 @@ export interface BillingP95Result {
   sample_count: number;
   computed_at: string;
 }
+
+export type CronStep = 'collect' | 'retry' | 'reconcile' | 'daily';

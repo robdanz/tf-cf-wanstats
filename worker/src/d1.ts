@@ -1,4 +1,4 @@
-import type { NormalizedRow, TunnelStat, GapCell, TrackedGapCell } from './types';
+import type { NormalizedRow, TunnelStat, GapCell, TrackedGapCell, CronStep } from './types';
 
 const BATCH_SIZE = 100;
 
@@ -87,6 +87,34 @@ export async function purgeOldData(db: D1Database): Promise<{
     dailyDeleted: dailyResult.meta.changes ?? 0,
     gapTrackingDeleted: gapResult.meta.changes ?? 0,
   };
+}
+
+// ── Ledger helpers (reconcile.ts) ───────────────────────────────────────────
+
+// Two per-direction queries keep idx_tm_direction_ts (direction, ts) in play.
+// Bounds are raw ts format ('YYYY-MM-DDTHH:MM:SSZ').
+export async function getRawRowsForHour(
+  db: D1Database,
+  hourStart: string,
+  hourEnd: string,
+): Promise<{ ingress: NormalizedRow[]; egress: NormalizedRow[] }> {
+  const sql = 'SELECT tunnel_name, ts, bit_rate FROM tunnel_metrics WHERE direction = ? AND ts >= ? AND ts < ?';
+  type Row = { tunnel_name: string; ts: string; bit_rate: number };
+  const [ing, eg] = await Promise.all([
+    db.prepare(sql).bind('ingress', hourStart, hourEnd).all<Row>(),
+    db.prepare(sql).bind('egress', hourStart, hourEnd).all<Row>(),
+  ]);
+  const toRows = (rows: Row[]): NormalizedRow[] =>
+    rows.map((r) => ({ tunnelName: r.tunnel_name, ts: r.ts, bitRate: r.bit_rate }));
+  return { ingress: toRows(ing.results), egress: toRows(eg.results) };
+}
+
+// MIN(ts) over one direction is an index-range read; a bare MIN(ts) would
+// scan the table.
+export async function getOldestRawTs(db: D1Database): Promise<string | null> {
+  const row = await db.prepare("SELECT MIN(ts) AS ts FROM tunnel_metrics WHERE direction = 'ingress'")
+    .first<{ ts: string | null }>();
+  return row?.ts ?? null;
 }
 
 // ── Gap tracking (detect + bounded auto-repoll) ─────────────────────────────
@@ -480,6 +508,19 @@ export async function getMetadata(db: D1Database, key: string): Promise<string |
 
 export async function setMetadata(db: D1Database, key: string, value: string): Promise<void> {
   await db.prepare('INSERT OR REPLACE INTO cron_metadata (key, value) VALUES (?, ?)').bind(key, value).run();
+}
+
+const MAX_ERROR_MESSAGE_CHARS = 500;
+
+export async function recordCronError(db: D1Database, step: CronStep, err: unknown): Promise<void> {
+  const message = (err instanceof Error ? err.message : String(err)).slice(0, MAX_ERROR_MESSAGE_CHARS);
+  console.error(`Cron step ${step} failed: ${message}`);
+  const upsert = 'INSERT OR REPLACE INTO cron_metadata (key, value) VALUES (?, ?)';
+  await db.batch([
+    db.prepare(upsert).bind('last_error_at', new Date().toISOString()),
+    db.prepare(upsert).bind('last_error_step', step),
+    db.prepare(upsert).bind('last_error_message', message),
+  ]);
 }
 
 // ── Billing p95 storage ─────────────────────────────────────────────────────
