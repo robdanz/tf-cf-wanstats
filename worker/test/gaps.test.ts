@@ -65,7 +65,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe('runGapCheck retry phase', () => {
+describe('retryPendingGaps', () => {
   it('deletes a pending gap once the repoll returns its data, and rolls up the affected hour', async () => {
     await applyTestSchema(DB);
     const ts = '2026-08-01T10:05:00Z';
