@@ -246,12 +246,23 @@ export async function incrementOrConfirmGaps(db: D1Database, cells: GapCell[], n
 // a bare "ts >= ?" would full-scan tunnel_metrics (millions of rows at
 // 500+ tunnels x 7-day retention).
 export const CURRENT_METRICS_SQL = `
-  SELECT tunnel_name, direction, ts, bit_rate FROM tunnel_metrics
+  SELECT tunnel_name, direction, ts, bit_rate, written_at FROM tunnel_metrics
   WHERE direction = 'ingress' AND ts >= ?1
   UNION ALL
-  SELECT tunnel_name, direction, ts, bit_rate FROM tunnel_metrics
+  SELECT tunnel_name, direction, ts, bit_rate, written_at FROM tunnel_metrics
   WHERE direction = 'egress' AND ts >= ?1
   ORDER BY tunnel_name, direction, ts
+`;
+
+// ── Changed-since query (/api/current?since=) ───────────────────────────────
+// Bind: ?1 = since (exclusive), ?2 = until (inclusive), both toISOString()
+// form to match written_at; ?3 = row limit. Uses the partial index
+// idx_tm_written_at; NULL (pre-migration) rows never match.
+export const CHANGED_SINCE_SQL = `
+  SELECT tunnel_name, direction, ts, bit_rate, written_at FROM tunnel_metrics
+  WHERE written_at > ?1 AND written_at <= ?2
+  ORDER BY written_at, tunnel_name, direction, ts
+  LIMIT ?3
 `;
 
 // ── SQL for per-tunnel p95 ──────────────────────────────────────────────────

@@ -10,6 +10,7 @@ import {
   getBillingP95Tunnels,
   storeTunnelMetrics,
   CURRENT_METRICS_SQL,
+  CHANGED_SINCE_SQL,
 } from './d1';
 import { fetchMetricsTimeSliced } from './graphql';
 import { writeRawToR2, streamCsvExport, cleanupRawDay } from './r2';
@@ -23,6 +24,9 @@ const VALID_SORT_COLUMNS: Record<string, string> = {
 };
 
 const VALID_SORT_DIRS = new Set(['ASC', 'DESC']);
+
+const CHANGED_SINCE_MAX_ROWS = 20000;
+const CHANGED_SINCE_LAG_MS = 60 * 1000;
 
 export async function handleApiRequest(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
@@ -259,19 +263,68 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
   }
 
   if (pathname === '/api/current') {
+    const now = new Date();
+    const sinceParam = url.searchParams.get('since');
+
+    if (sinceParam !== null) {
+      if (isNaN(Date.parse(sinceParam))) return new Response('Invalid since — use ISO 8601', { status: 400 });
+      const since = new Date(sinceParam).toISOString();
+      // 60s lag: every row of one storeTunnelMetrics call shares a written_at
+      // and commits within seconds, so nothing mid-commit is ever skipped.
+      const until = new Date(now.getTime() - CHANGED_SINCE_LAG_MS).toISOString();
+
+      const maxParam = parseInt(url.searchParams.get('_max_rows') ?? '', 10);
+      const maxRows = Number.isInteger(maxParam) && maxParam > 0 && maxParam < CHANGED_SINCE_MAX_ROWS
+        ? maxParam
+        : CHANGED_SINCE_MAX_ROWS;
+
+      const { results } = await env.DB.prepare(CHANGED_SINCE_SQL)
+        .bind(since, until, maxRows + 1)
+        .all<{ tunnel_name: string; direction: string; ts: string; bit_rate: number; written_at: string }>();
+
+      let rows = results;
+      let truncated = false;
+      let nextSince = until;
+      if (results.length > maxRows) {
+        truncated = true;
+        // Drop the incomplete trailing written_at group so a group is never
+        // split across pages; resume from the last complete group.
+        const cutoff = results[maxRows].written_at;
+        const complete = results.filter((r) => r.written_at !== cutoff);
+        rows = complete.length > 0 ? complete : results.slice(0, maxRows);
+        nextSince = rows[rows.length - 1].written_at;
+      }
+
+      return Response.json({
+        generated_at: now.toISOString(),
+        mode: 'since',
+        since,
+        next_since: nextSince,
+        truncated,
+        row_count: rows.length,
+        rows: rows.map((r) => ({
+          tunnel_name: r.tunnel_name,
+          direction: r.direction,
+          ts: r.ts,
+          bit_rate_bps: r.bit_rate,
+          written_at: r.written_at,
+        })),
+      }, { headers: { 'Cache-Control': 'no-store' } });
+    }
+
     const windowParam = parseInt(url.searchParams.get('window') ?? '', 10);
     const windowMinutes = isNaN(windowParam) ? 20 : Math.min(1440, Math.max(5, windowParam));
-    const now = new Date();
     // Match the raw ts storage format (no milliseconds) for clean string comparison.
     const since = new Date(now.getTime() - windowMinutes * 60 * 1000)
       .toISOString().slice(0, 19) + 'Z';
 
     const { results } = await env.DB.prepare(CURRENT_METRICS_SQL)
       .bind(since)
-      .all<{ tunnel_name: string; direction: string; ts: string; bit_rate: number }>();
+      .all<{ tunnel_name: string; direction: string; ts: string; bit_rate: number; written_at: string | null }>();
 
     return Response.json({
       generated_at: now.toISOString(),
+      mode: 'window',
       window_minutes: windowMinutes,
       row_count: results.length,
       rows: results.map((r) => ({
@@ -279,6 +332,7 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
         direction: r.direction,
         ts: r.ts,
         bit_rate_bps: r.bit_rate,
+        written_at: r.written_at,
       })),
     }, { headers: { 'Cache-Control': 'no-store' } });
   }
