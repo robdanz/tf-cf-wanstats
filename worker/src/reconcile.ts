@@ -68,11 +68,19 @@ async function reconcileHour(env: Env, hour: Date, now: Date): Promise<void> {
 export async function reconcileHours(
   env: Env,
   now: Date,
+  deadlineMs = 4 * 60 * 1000,
 ): Promise<{ processed: number; hoursBehind: number; reconciledThrough: string | null }> {
+  const startedAt = Date.now();
   const stored = await getMetadata(env.DB, 'reconciled_through');
-  let watermark = stored
-    ? new Date(stored)
-    : computeInitialWatermark(await getOldestRawTs(env.DB), now);
+  let watermark: Date;
+  if (stored) {
+    const parsed = new Date(stored);
+    watermark = isNaN(parsed.getTime())
+      ? computeInitialWatermark(await getOldestRawTs(env.DB), now)
+      : snapToHour(parsed);
+  } else {
+    watermark = computeInitialWatermark(await getOldestRawTs(env.DB), now);
+  }
 
   // Nothing older than raw retention can be reconciled; the purge is about
   // to delete it anyway.
@@ -82,11 +90,28 @@ export async function reconcileHours(
   let hour = new Date(watermark.getTime() + HOUR_MS);
   let processed = 0;
   while (hour.getTime() + SETTLE_MS <= now.getTime() && processed < MAX_HOURS_PER_RUN) {
+    // The first hour always runs so a stuck ledger always makes some
+    // progress; only later hours in the same run are subject to the budget.
+    if (processed > 0 && Date.now() - startedAt >= deadlineMs) {
+      console.log(`Ledger: deadline reached after ${processed} hour(s)`);
+      break;
+    }
     await reconcileHour(env, hour, now);
     await setMetadata(env.DB, 'reconciled_through', hourKey(hour));
     watermark = hour;
     hour = new Date(hour.getTime() + HOUR_MS);
     processed++;
+  }
+
+  // First-deploy catch-up can take ~33 hours to walk the ledger up to "now";
+  // until it does, the most recent hours never get an hourly row and the
+  // 7d/30d views show a growing hole. Fast-path the newest settled hour's
+  // rollup so recent data appears immediately — it's idempotent, and the
+  // ledger will rewrite it properly (gap tracking, R2) once it walks there.
+  const newestEligible = snapToHour(new Date(now.getTime() - SETTLE_MS));
+  if (newestEligible > watermark) {
+    const n = await rollupHour(env.DB, newestEligible.toISOString());
+    console.log(`Ledger fast-path rollupHour ${hourKey(newestEligible)}: ${n} rows`);
   }
 
   const hoursBehind = Math.max(0, Math.floor((now.getTime() - SETTLE_MS - watermark.getTime()) / HOUR_MS));

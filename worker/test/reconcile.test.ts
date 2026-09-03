@@ -123,4 +123,40 @@ describe('reconcileHours', () => {
     // Floor is 2026-09-03T00:00; first hour processed is 01:00, six hours -> 06:00.
     expect(result.reconciledThrough).toBe('2026-09-03T06:00:00Z');
   });
+
+  it('fast-path rolls up the newest eligible hour during catch-up, ahead of the walked watermark', async () => {
+    await applyTestSchema(DB);
+    await seedHour('LEDGER_FASTPATH', 'ingress', '2026-09-07T10:00:00Z', '2026-09-07T11:00:00Z');
+    await setMetadata(DB, 'reconciled_through', '2026-09-07T00:00:00Z');
+
+    // 12:05: eligible hours are 01:00..10:00 (10:00+2h=12:00<=12:05); the walk
+    // caps at MAX_HOURS_PER_RUN, so it only reaches 06:00.
+    const result = await reconcileHours(TEST_ENV, new Date('2026-09-07T12:05:00Z'));
+
+    expect(result.reconciledThrough).toBe('2026-09-07T06:00:00Z');
+
+    const hourly = await DB.prepare('SELECT sample_count FROM tunnel_metrics_hourly WHERE tunnel_name = ? AND direction = ? AND ts = ?')
+      .bind('LEDGER_FASTPATH', 'ingress', '2026-09-07T10:00:00.000Z').first<{ sample_count: number }>();
+    expect(hourly?.sample_count).toBe(12);
+  });
+
+  it('respects a deadline: the first hour always runs, later hours in the same run do not', async () => {
+    await applyTestSchema(DB);
+    await setMetadata(DB, 'reconciled_through', '2020-01-01T00:00:00Z');
+
+    const result = await reconcileHours(TEST_ENV, new Date('2026-09-10T00:00:00Z'), 0);
+
+    expect(result.processed).toBe(1);
+  });
+
+  it('recovers from a garbage stored watermark instead of throwing', async () => {
+    await applyTestSchema(DB);
+    await setMetadata(DB, 'reconciled_through', 'garbage');
+
+    const result = await reconcileHours(TEST_ENV, new Date('2026-09-08T12:00:00Z'));
+
+    expect(result.reconciledThrough).not.toBeNull();
+    expect(() => new Date(result.reconciledThrough!).toISOString()).not.toThrow();
+    expect(isNaN(new Date(result.reconciledThrough!).getTime())).toBe(false);
+  });
 });
