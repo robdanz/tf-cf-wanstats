@@ -7,8 +7,9 @@ import { retryPendingGaps } from './gaps';
 import { reconcileHours } from './reconcile';
 
 // Cron fires every 5 minutes. The minute-0 slot is the full run (65-min
-// lookback, R2 write, pending-gap retry, hour ledger, midnight tasks); the
-// other slots are light runs that only refresh recent raw data in D1.
+// lookback, R2 write, hour ledger, midnight tasks); every run — light or
+// full — also retries pending gap cells, since a gap can be repaired as soon
+// as its raw data settles rather than waiting for the next full run.
 //
 // Every full-run step runs under its own try/catch and records its failure
 // in cron_metadata (last_error_*). A failure in one step never skips the
@@ -19,7 +20,13 @@ export async function handleCron(env: Env, now: Date = new Date()): Promise<void
   const windowStart = new Date(now.getTime() - lookbackMinutes * 60 * 1000);
 
   console.log(`Cron run: ${fullRun ? 'full' : 'light'} (lookback ${lookbackMinutes}m)`);
-  if (fullRun) await setMetadata(env.DB, 'last_full_run_at', now.toISOString());
+  if (fullRun) {
+    try {
+      await setMetadata(env.DB, 'last_full_run_at', now.toISOString());
+    } catch (err) {
+      console.error(`Failed to write last_full_run_at: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
 
   let ok = true;
 
@@ -30,14 +37,14 @@ export async function handleCron(env: Env, now: Date = new Date()): Promise<void
     await recordCronError(env.DB, 'collect', err);
   }
 
-  if (!fullRun) return;
-
   try {
     await retryPendingGaps(env, now);
   } catch (err) {
     ok = false;
     await recordCronError(env.DB, 'retry', err);
   }
+
+  if (!fullRun) return;
 
   try {
     await reconcileHours(env, now);
@@ -55,7 +62,11 @@ export async function handleCron(env: Env, now: Date = new Date()): Promise<void
     }
   }
 
-  await setMetadata(env.DB, 'last_full_run_ok', ok ? 'true' : 'false');
+  try {
+    await setMetadata(env.DB, 'last_full_run_ok', ok ? 'true' : 'false');
+  } catch (err) {
+    console.error(`Failed to write last_full_run_ok: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 async function collect(env: Env, now: Date, windowStart: Date, fullRun: boolean): Promise<void> {

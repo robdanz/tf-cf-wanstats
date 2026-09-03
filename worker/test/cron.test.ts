@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { env } from 'cloudflare:workers';
 import { handleCron } from '../src/cron';
-import { getMetadata, setMetadata, storeTunnelMetrics } from '../src/d1';
+import { getMetadata, setMetadata, storeTunnelMetrics, insertGapCells, getPendingGaps } from '../src/d1';
 import { applyTestSchema } from './helpers/schema';
 
 const DB = (env as { DB: D1Database }).DB;
@@ -59,6 +59,10 @@ describe('handleCron full run', () => {
 
   it('light run stores rows and does not touch the ledger', async () => {
     await applyTestSchema(DB);
+    // Retry now runs on every cron (F5b); clear gap cells left behind by an
+    // earlier test in this file so they don't get repolled here too, using
+    // this test's own fetch stub, and inflate the CRON_LIGHT row count below.
+    await DB.exec('DELETE FROM gap_tracking');
     await setMetadata(DB, 'reconciled_through', '2026-08-12T07:00:00Z');
     vi.stubGlobal('fetch', vi.fn().mockImplementation(async (_url: string, init: RequestInit) => {
       const body = JSON.parse(init.body as string) as { variables: { datetimeStart: string } };
@@ -70,5 +74,21 @@ describe('handleCron full run', () => {
     const count = await DB.prepare("SELECT COUNT(*) AS n FROM tunnel_metrics WHERE tunnel_name = 'CRON_LIGHT'").first<{ n: number }>();
     expect(count?.n).toBe(4); // 20-minute window -> 4 complete buckets
     expect(await getMetadata(DB, 'reconciled_through')).toBe('2026-08-12T07:00:00Z');
+  });
+
+  it('light run also retries pending gap cells', async () => {
+    await applyTestSchema(DB);
+    const ts = '2026-08-13T09:00:00Z';
+    await insertGapCells(DB, [{ tunnelName: 'CRON_RETRY_LIGHT', direction: 'ingress', ts }], '2026-08-13T09:06:00Z');
+
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(init.body as string) as { variables: { datetimeStart: string } };
+      return graphqlRows([{ name: 'CRON_RETRY_LIGHT', ts: body.variables.datetimeStart.replace('.000Z', 'Z'), rate: 7 }]);
+    }));
+
+    await handleCron(TEST_ENV, new Date('2026-08-13T10:16:00Z')); // minute 16 -> light run
+
+    const pending = await getPendingGaps(DB, 100);
+    expect(pending.find((p) => p.tunnelName === 'CRON_RETRY_LIGHT')).toBeUndefined();
   });
 });

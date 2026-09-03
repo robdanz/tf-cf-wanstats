@@ -87,7 +87,10 @@ export async function purgeOldData(db: D1Database): Promise<{
     db.prepare('DELETE FROM tunnel_metrics WHERE ts < ?').bind(rawCutoff.toISOString()).run(),
     db.prepare('DELETE FROM tunnel_metrics_hourly WHERE ts < ?').bind(hourlyCutoff.toISOString()).run(),
     db.prepare('DELETE FROM tunnel_metrics_daily WHERE ts < ?').bind(dailyCutoff.toISOString()).run(),
-    db.prepare('DELETE FROM gap_tracking WHERE confirmed_empty_at IS NOT NULL AND confirmed_empty_at < ?').bind(rawCutoff.toISOString()).run(),
+    // A gap cell whose ts predates raw retention can never be repaired (the
+    // raw row it would resolve against is about to be purged too), so status
+    // no longer matters — pending or confirmed_empty, it goes.
+    db.prepare('DELETE FROM gap_tracking WHERE ts < ?').bind(rawCutoff.toISOString()).run(),
   ]);
 
   return {
