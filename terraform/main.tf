@@ -107,10 +107,27 @@ resource "null_resource" "migrate_0003" {
   }
 }
 
+resource "null_resource" "migrate_0004" {
+  depends_on = [null_resource.migrate_0003, local_file.wrangler_jsonc]
+
+  triggers = {
+    migration_hash = filesha256("${path.module}/../migrations/0004_written_at.sql")
+    database_id    = cloudflare_d1_database.metrics.id
+  }
+
+  provisioner "local-exec" {
+    working_dir = "${path.module}/../worker"
+    command     = "npx wrangler d1 execute tf-cf-wanstats-metrics --remote --file=${abspath(path.module)}/../migrations/0004_written_at.sql"
+    environment = {
+      CLOUDFLARE_API_TOKEN = var.cloudflare_api_token
+    }
+  }
+}
+
 # ── Deploy Worker ──────────────────────────────────────────────────────────────
 
 resource "null_resource" "deploy" {
-  depends_on = [null_resource.migrate, null_resource.migrate_0002, null_resource.migrate_0003]
+  depends_on = [null_resource.migrate, null_resource.migrate_0002, null_resource.migrate_0003, null_resource.migrate_0004]
 
   triggers = {
     # Hash all source files so any change triggers redeploy
@@ -122,6 +139,7 @@ resource "null_resource" "deploy" {
       filesha256("${path.module}/../worker/src/r2.ts"),
       filesha256("${path.module}/../worker/src/cron.ts"),
       filesha256("${path.module}/../worker/src/gaps.ts"),
+      filesha256("${path.module}/../worker/src/reconcile.ts"),
       filesha256("${path.module}/../worker/src/api.ts"),
       filesha256("${path.module}/../worker/src/dashboard.ts"),
       filesha256("${path.module}/../worker/src/utils.ts"),
