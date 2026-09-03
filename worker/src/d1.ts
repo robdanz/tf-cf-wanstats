@@ -2,19 +2,28 @@ import type { NormalizedRow, TunnelStat, GapCell, TrackedGapCell } from './types
 
 const BATCH_SIZE = 100;
 
+// Conditional upsert: written_at moves only when the row is new or its value
+// changed. Light runs re-fetch the same buckets every 5 minutes; with plain
+// INSERT OR REPLACE every one of those would look "changed" to
+// /api/current?since= polling.
 export async function storeTunnelMetrics(
   db: D1Database,
   rows: NormalizedRow[],
   direction: 'ingress' | 'egress',
+  writtenAt: string = new Date().toISOString(),
 ): Promise<void> {
   if (rows.length === 0) return;
   for (let i = 0; i < rows.length; i += BATCH_SIZE) {
     const chunk = rows.slice(i, i + BATCH_SIZE);
     await db.batch(
       chunk.map((row) =>
-        db.prepare(
-          'INSERT OR REPLACE INTO tunnel_metrics (tunnel_name, direction, ts, bit_rate) VALUES (?, ?, ?, ?)',
-        ).bind(row.tunnelName, direction, row.ts, row.bitRate),
+        db.prepare(`
+          INSERT INTO tunnel_metrics (tunnel_name, direction, ts, bit_rate, written_at)
+          VALUES (?, ?, ?, ?, ?)
+          ON CONFLICT (tunnel_name, direction, ts) DO UPDATE
+            SET bit_rate = excluded.bit_rate, written_at = excluded.written_at
+            WHERE bit_rate IS NOT excluded.bit_rate
+        `).bind(row.tunnelName, direction, row.ts, row.bitRate, writtenAt),
       ),
     );
   }
