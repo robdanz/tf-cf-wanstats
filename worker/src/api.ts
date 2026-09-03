@@ -11,6 +11,7 @@ import {
   storeTunnelMetrics,
   CURRENT_METRICS_SQL,
   CHANGED_SINCE_SQL,
+  CHANGED_SINCE_GROUP_SQL,
 } from './d1';
 import { fetchMetricsTimeSliced } from './graphql';
 import { writeRawToR2, streamCsvExport, cleanupRawDay } from './r2';
@@ -287,12 +288,22 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
       let nextSince = until;
       if (results.length > maxRows) {
         truncated = true;
-        // Drop the incomplete trailing written_at group so a group is never
-        // split across pages; resume from the last complete group.
         const cutoff = results[maxRows].written_at;
         const complete = results.filter((r) => r.written_at !== cutoff);
-        rows = complete.length > 0 ? complete : results.slice(0, maxRows);
-        nextSince = rows[rows.length - 1].written_at;
+        if (complete.length > 0) {
+          // Drop the incomplete trailing group; resume from the last complete one.
+          rows = complete;
+          nextSince = rows[rows.length - 1].written_at;
+        } else {
+          // The whole page is one group. Return it intact even though it
+          // exceeds the cap: splitting it would lose its tail forever, since
+          // the next poll filters written_at > next_since.
+          const group = await env.DB.prepare(CHANGED_SINCE_GROUP_SQL)
+            .bind(cutoff)
+            .all<{ tunnel_name: string; direction: string; ts: string; bit_rate: number; written_at: string }>();
+          rows = group.results;
+          nextSince = cutoff;
+        }
       }
 
       return Response.json({

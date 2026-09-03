@@ -75,4 +75,18 @@ describe('/api/current?since= truncation', () => {
     expect(body.rows.map((r) => r.written_at)).toEqual([t1, t1, t1]);
     expect(body.next_since).toBe(t1);
   });
+
+  it('returns an oversized written_at group intact instead of splitting it', async () => {
+    await applyTestSchema(DB);
+    const t1 = '2026-09-03T00:06:00.000Z';
+    await storeTunnelMetrics(DB, ['BIG_1', 'BIG_2', 'BIG_3', 'BIG_4', 'BIG_5'].map((n) => ({ tunnelName: n, ts: '2026-09-03T00:00:00Z', bitRate: 1 })), 'ingress', t1);
+
+    const res = await call('?since=2026-09-03T00:00:00.000Z&_max_rows=2');
+    const body = await res.json() as SinceBody;
+
+    expect(body.truncated).toBe(true);
+    expect(body.rows.filter((r) => r.tunnel_name.startsWith('BIG_'))).toHaveLength(5);
+    expect(body.rows.every((r) => r.written_at === t1)).toBe(true);
+    expect(body.next_since).toBe(t1);
+  });
 });

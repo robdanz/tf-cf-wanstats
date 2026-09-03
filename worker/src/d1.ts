@@ -265,6 +265,15 @@ export const CHANGED_SINCE_SQL = `
   LIMIT ?3
 `;
 
+// Fallback for /api/current?since= when a single written_at group is larger
+// than the page: fetch the whole group (equality on the indexed column) so it
+// is returned intact rather than split across pages. Bind: ?1 = written_at.
+export const CHANGED_SINCE_GROUP_SQL = `
+  SELECT tunnel_name, direction, ts, bit_rate, written_at FROM tunnel_metrics
+  WHERE written_at = ?1
+  ORDER BY tunnel_name, direction, ts
+`;
+
 // ── SQL for per-tunnel p95 ──────────────────────────────────────────────────
 // Bind params: ?1=tunnel_name, ?2=direction, ?3=since, ?4=until, ?5=step_seconds
 //
