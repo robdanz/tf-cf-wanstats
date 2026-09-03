@@ -370,7 +370,10 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
 
       let rows = results;
       let truncated = false;
-      let nextSince = until;
+      // until can be behind since (a since= right up against "now", inside
+      // the 60s lag): never report a next_since older than what the caller
+      // already has.
+      let nextSince = until > since ? until : since;
       if (results.length > maxRows) {
         truncated = true;
         const cutoff = results[maxRows].written_at;

@@ -39,4 +39,24 @@ describe('storeTunnelMetrics written_at', () => {
     expect(row?.written_at).not.toBeNull();
     expect(row!.written_at! >= before).toBe(true);
   });
+
+  it('stamps written_at per D1 batch (BATCH_SIZE = 100), not once for the whole call', async () => {
+    const rows = Array.from({ length: 250 }, (_, i) => ({
+      tunnelName: `WA_CHUNK_${i}`,
+      ts: '2026-09-01T00:00:00Z',
+      bitRate: 1,
+    }));
+    await storeTunnelMetrics(DB, rows, 'ingress');
+
+    const result = await DB.prepare(
+      "SELECT COUNT(DISTINCT written_at) AS n FROM tunnel_metrics WHERE tunnel_name LIKE 'WA_CHUNK_%'",
+    ).first<{ n: number }>();
+    expect(result!.n).toBeGreaterThanOrEqual(1);
+    expect(result!.n).toBeLessThanOrEqual(3);
+
+    const nullCount = await DB.prepare(
+      "SELECT COUNT(*) AS n FROM tunnel_metrics WHERE tunnel_name LIKE 'WA_CHUNK_%' AND written_at IS NULL",
+    ).first<{ n: number }>();
+    expect(nullCount!.n).toBe(0);
+  });
 });

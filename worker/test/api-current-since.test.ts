@@ -51,6 +51,14 @@ describe('/api/current?since=', () => {
     expect(res.status).toBe(400);
   });
 
+  it('never reports a next_since older than since, even when until lands behind it', async () => {
+    const since = new Date().toISOString();
+    const res = await call(`?since=${since}`);
+    const body = await res.json() as SinceBody;
+    expect(body.rows).toEqual([]);
+    expect(body.next_since).toBe(since);
+  });
+
   it('keeps window mode unchanged apart from the mode field', async () => {
     const res = await call('?window=20');
     const body = await res.json() as { mode: string; window_minutes: number; rows: unknown[] };

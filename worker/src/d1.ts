@@ -6,15 +6,24 @@ const BATCH_SIZE = 100;
 // changed. Light runs re-fetch the same buckets every 5 minutes; with plain
 // INSERT OR REPLACE every one of those would look "changed" to
 // /api/current?since= polling.
+//
+// written_at is stamped per D1 batch, not once for the whole call: a full run
+// writes thousands of rows across many sequential db.batch() calls, and
+// stamping them all with one timestamp let /api/current?since= observe a
+// half-committed group and skip its uncommitted tail. When the caller omits
+// writtenAt, a written_at group is now at most one D1 batch (BATCH_SIZE rows).
+// An explicit writtenAt (tests, callers that pass one) still applies to every
+// chunk, preserving single-group semantics for callers that want it.
 export async function storeTunnelMetrics(
   db: D1Database,
   rows: NormalizedRow[],
   direction: 'ingress' | 'egress',
-  writtenAt: string = new Date().toISOString(),
+  writtenAt?: string,
 ): Promise<void> {
   if (rows.length === 0) return;
   for (let i = 0; i < rows.length; i += BATCH_SIZE) {
     const chunk = rows.slice(i, i + BATCH_SIZE);
+    const stamp = writtenAt ?? new Date().toISOString();
     await db.batch(
       chunk.map((row) =>
         db.prepare(`
@@ -23,7 +32,7 @@ export async function storeTunnelMetrics(
           ON CONFLICT (tunnel_name, direction, ts) DO UPDATE
             SET bit_rate = excluded.bit_rate, written_at = excluded.written_at
             WHERE bit_rate IS NOT excluded.bit_rate
-        `).bind(row.tunnelName, direction, row.ts, row.bitRate, writtenAt),
+        `).bind(row.tunnelName, direction, row.ts, row.bitRate, stamp),
       ),
     );
   }
@@ -318,10 +327,13 @@ export const CHANGED_SINCE_SQL = `
 // Fallback for /api/current?since= when a single written_at group is larger
 // than the page: fetch the whole group (equality on the indexed column) so it
 // is returned intact rather than split across pages. Bind: ?1 = written_at.
+// LIMIT 100000 is a sanity cap only — a single write group (one D1 batch,
+// BATCH_SIZE = 100 rows since F1) can never approach it in practice.
 export const CHANGED_SINCE_GROUP_SQL = `
   SELECT tunnel_name, direction, ts, bit_rate, written_at FROM tunnel_metrics
   WHERE written_at = ?1
   ORDER BY tunnel_name, direction, ts
+  LIMIT 100000
 `;
 
 // ── SQL for per-tunnel p95 ──────────────────────────────────────────────────
