@@ -24,3 +24,6 @@ CLAUDE.md
 
 # Docs, plans, and specs (local only)
 docs/
+
+# Subagent-driven-development scratch (ledger, briefs, review packages)
+.superpowers/
