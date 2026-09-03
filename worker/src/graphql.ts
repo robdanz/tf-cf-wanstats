@@ -122,21 +122,43 @@ async function fetchSingleBucket(
   };
 }
 
+export interface FetchResult {
+  ingress: NormalizedRow[];
+  egress: NormalizedRow[];
+  warnings: string[];
+  // Slice start timestamps (toISOString form) whose fetch failed after
+  // retries. Callers store what came back and treat these buckets as
+  // unknown, never as empty.
+  failedSlices: string[];
+  sliceCount: number;
+}
+
 export async function fetchMetricsTimeSliced(
   accountId: string,
   apiToken: string,
   start: Date,
   end: Date,
-): Promise<{ ingress: NormalizedRow[]; egress: NormalizedRow[]; warnings: string[] }> {
+): Promise<FetchResult> {
   const slices = generateTimeSlices(start, end);
   const allIngress: NormalizedRow[] = [];
   const allEgress: NormalizedRow[] = [];
   const warnings: string[] = [];
+  const failedSlices: string[] = [];
 
   for (const slice of slices) {
-    const { ingress, egress } = await fetchSingleBucket(
-      accountId, apiToken, slice.start, slice.end,
-    );
+    let ingress: IngressRow[];
+    let egress: EgressRow[];
+    try {
+      ({ ingress, egress } = await fetchSingleBucket(accountId, apiToken, slice.start, slice.end));
+    } catch (err) {
+      // One bad bucket must not discard the other twelve: the ledger
+      // (reconcile.ts) will find whatever is missing for this hour later.
+      const msg = `Slice ${slice.start} failed: ${err instanceof Error ? err.message : String(err)}`;
+      console.warn(msg);
+      warnings.push(msg);
+      failedSlices.push(slice.start);
+      continue;
+    }
 
     if (ingress.length >= GRAPHQL_LIMIT) {
       const msg = `WARNING: Ingress hit limit ${GRAPHQL_LIMIT} for bucket ${slice.start}. Data may be truncated.`;
@@ -154,9 +176,9 @@ export async function fetchMetricsTimeSliced(
     allEgress.push(...normalized.egress);
   }
 
-  console.log(`Fetched ${allIngress.length} ingress rows, ${allEgress.length} egress rows across ${slices.length} time slices`);
+  console.log(`Fetched ${allIngress.length} ingress rows, ${allEgress.length} egress rows across ${slices.length} time slices (${failedSlices.length} failed)`);
 
-  return { ingress: allIngress, egress: allEgress, warnings };
+  return { ingress: allIngress, egress: allEgress, warnings, failedSlices, sliceCount: slices.length };
 }
 
 export function normalizeMetrics(

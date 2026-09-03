@@ -45,29 +45,33 @@ describe('fetchSingleBucket retry on rate limit', () => {
     expect(egress).toEqual([]);
   });
 
-  it('gives up after exhausting retries and reports the 429', async () => {
+  it('gives up after exhausting retries and reports the slice as failed', async () => {
     const fetchMock = vi.fn().mockResolvedValue(rateLimited());
     vi.stubGlobal('fetch', fetchMock);
 
-    await expect(fetchMetricsTimeSliced(
+    const result = await fetchMetricsTimeSliced(
       'acct', 'token',
       new Date('2026-07-21T04:00:00Z'),
       new Date('2026-07-21T04:05:00Z'),
-    )).rejects.toThrow(/429/);
+    );
 
     expect(fetchMock).toHaveBeenCalledTimes(4); // initial + 3 retries
+    expect(result.failedSlices).toEqual(['2026-07-21T04:00:00.000Z']);
+    expect(result.warnings.some((w) => w.includes('429'))).toBe(true);
   });
 
-  it('does not retry a non-retryable client error', async () => {
+  it('does not retry a non-retryable client error but still reports the slice', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response('bad request', { status: 400 }));
     vi.stubGlobal('fetch', fetchMock);
 
-    await expect(fetchMetricsTimeSliced(
+    const result = await fetchMetricsTimeSliced(
       'acct', 'token',
       new Date('2026-07-21T04:00:00Z'),
       new Date('2026-07-21T04:05:00Z'),
-    )).rejects.toThrow(/400/);
+    );
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(result.failedSlices).toEqual(['2026-07-21T04:00:00.000Z']);
+    expect(result.warnings.some((w) => w.includes('400'))).toBe(true);
   });
 });

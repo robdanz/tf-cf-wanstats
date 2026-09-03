@@ -323,7 +323,7 @@ async function handleBackfill(request: Request, env: Env): Promise<Response> {
     return new Response('start must be before end', { status: 400 });
   }
 
-  const { ingress, egress, warnings } = await fetchMetricsTimeSliced(
+  const { ingress, egress, warnings, failedSlices } = await fetchMetricsTimeSliced(
     env.ACCOUNT_ID,
     env.WAN_API_TOKEN,
     new Date(start),
@@ -343,6 +343,7 @@ async function handleBackfill(request: Request, env: Env): Promise<Response> {
     end,
     ingress_rows: ingress.length,
     egress_rows: egress.length,
+    failed_slices: failedSlices,
     warnings,
   });
 }
