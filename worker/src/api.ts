@@ -476,12 +476,22 @@ async function handleBackfill(request: Request, env: Env): Promise<Response> {
     return new Response('start must be before end', { status: 400 });
   }
 
-  const { ingress, egress, warnings, failedSlices } = await fetchMetricsTimeSliced(
+  const { ingress, egress, warnings, failedSlices, sliceCount } = await fetchMetricsTimeSliced(
     env.ACCOUNT_ID,
     env.WAN_API_TOKEN,
     new Date(start),
     new Date(end),
   );
+
+  if (sliceCount > 0 && failedSlices.length === sliceCount) {
+    // Every slice failed (e.g. rate-limited or upstream down): storing and
+    // writing R2 would be a no-op anyway, and a 200 here made
+    // scripts/backfill.sh count a rate-limited window as done.
+    const status = warnings.some((w) => w.includes('429')) ? 429 : 502;
+    return Response.json({
+      start, end, ingress_rows: 0, egress_rows: 0, failed_slices: failedSlices, warnings,
+    }, { status });
+  }
 
   await Promise.all([
     Promise.all([
