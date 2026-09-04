@@ -112,10 +112,17 @@ while [[ "$current" -lt "$end_epoch" ]]; do
 
   attempt=1
   while :; do
-    response=$(curl -s -X POST \
+    # -sS: quiet on success but still print curl's own error (DNS, TLS,
+    # connection refused). Without the || branch, set -e would abort the
+    # script silently on a transport failure, leaving only the window line.
+    response=$(curl -sS -X POST \
       "${WORKER_URL}/api/backfill?start=${window_start}&end=${window_end}" \
       -H "X-Backfill-Token: ${BACKFILL_TOKEN}" \
-      ${ACCESS_HEADERS[@]+"${ACCESS_HEADERS[@]}"})
+      ${ACCESS_HEADERS[@]+"${ACCESS_HEADERS[@]}"}) || {
+      echo "ERROR"
+      echo "    curl failed (exit $?) for ${WORKER_URL} — check WORKER_URL, network, and TLS" >&2
+      exit 1
+    }
 
     if echo "$response" | grep -q '"ingress_rows"'; then
       in_rows=$(echo "$response" | sed 's/.*"ingress_rows":\([0-9]*\).*/\1/')
