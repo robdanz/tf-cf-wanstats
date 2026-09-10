@@ -1,14 +1,14 @@
 import type { Env } from './types';
 import {
-  findMissingGapCells, insertGapCells, rollupHour, rollupDay,
+  findMissingBuckets, insertGapBuckets, rollupHour, rollupDay,
   getRawRowsForHour, getOldestRawTs, getMetadata, setMetadata,
 } from './d1';
 import { writeRawToR2 } from './r2';
 import { snapToHour, snapToDay } from './utils';
 
 // The hour ledger. Every full run walks hours from the persisted
-// `reconciled_through` watermark and, per hour, (1) tracks missing cells in
-// gap_tracking, (2) rewrites the hourly rollup, (3) rebuilds the hour's R2
+// `reconciled_through` watermark and, per hour, (1) tracks buckets with no
+// raw rows in gap_buckets, (2) rewrites the hourly rollup, (3) rebuilds the hour's R2
 // CSV from D1, (4) on the 23:00 hour rewrites the daily rollup. The
 // watermark advances only after all steps succeed, so an hour whose full
 // run died is repaired by the next good run instead of being lost.
@@ -20,7 +20,6 @@ const HOUR_MS = 60 * 60 * 1000;
 // delay the standalone hourly rollup used before the ledger existed.
 const SETTLE_MS = 2 * HOUR_MS;
 const RAW_RETENTION_MS = 7 * 24 * HOUR_MS;
-const ROSTER_MS = 24 * HOUR_MS;
 
 export function hourKey(d: Date): string {
   // Raw ts format: no milliseconds. Inputs are always hour-aligned.
@@ -41,10 +40,9 @@ async function reconcileHour(env: Env, hour: Date, now: Date): Promise<void> {
   const start = hourKey(hour);
   const endDate = new Date(hour.getTime() + HOUR_MS);
   const end = hourKey(endDate);
-  const rosterSince = hourKey(new Date(endDate.getTime() - ROSTER_MS));
 
-  const missing = await findMissingGapCells(env.DB, start, end, rosterSince);
-  if (missing.length > 0) await insertGapCells(env.DB, missing, now.toISOString());
+  const missing = await findMissingBuckets(env.DB, start, end);
+  if (missing.length > 0) await insertGapBuckets(env.DB, missing, now.toISOString());
 
   const rollupChanges = await rollupHour(env.DB, hour.toISOString());
 
@@ -62,7 +60,7 @@ async function reconcileHour(env: Env, hour: Date, now: Date): Promise<void> {
     console.log(`Ledger rollupDay ${day}: ${dayChanges} rows`);
   }
 
-  console.log(`Ledger ${start}: ${missing.length} new gap cell(s), rollup ${rollupChanges} rows, R2 ${r2Rows} rows`);
+  console.log(`Ledger ${start}: ${missing.length} new gap bucket(s), rollup ${rollupChanges} rows, R2 ${r2Rows} rows`);
 }
 
 export async function reconcileHours(

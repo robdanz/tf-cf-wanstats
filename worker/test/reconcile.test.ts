@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { env } from 'cloudflare:workers';
 import { reconcileHours, computeInitialWatermark, hourKey, MAX_HOURS_PER_RUN } from '../src/reconcile';
-import { storeTunnelMetrics, setMetadata, getMetadata, getPendingGaps, deleteResolvedGaps } from '../src/d1';
+import { storeTunnelMetrics, setMetadata, getMetadata, getPendingGapBuckets, deleteResolvedGapBuckets } from '../src/d1';
 import { applyTestSchema } from './helpers/schema';
 
 const DB = (env as { DB: D1Database }).DB;
@@ -40,7 +40,7 @@ describe('reconcileHours', () => {
     await applyTestSchema(DB);
     const holeA = '2026-09-01T10:20:00Z';
     await seedHour('LEDGER_A', 'ingress', '2026-09-01T09:00:00Z', '2026-09-01T12:00:00Z', [holeA]);
-    await seedHour('LEDGER_A', 'egress', '2026-09-01T09:00:00Z', '2026-09-01T12:00:00Z');
+    await seedHour('LEDGER_A', 'egress', '2026-09-01T09:00:00Z', '2026-09-01T12:00:00Z', [holeA]);
     await setMetadata(DB, 'reconciled_through', '2026-09-01T09:00:00Z');
 
     // 12:30: hours 10:00 (10+2h <= 12:30) is eligible; 11:00 is not (13:00 > 12:30).
@@ -49,8 +49,8 @@ describe('reconcileHours', () => {
     expect(result).toEqual({ processed: 1, hoursBehind: 0, reconciledThrough: '2026-09-01T10:00:00Z' });
     expect(await getMetadata(DB, 'reconciled_through')).toBe('2026-09-01T10:00:00Z');
 
-    const pending = await getPendingGaps(DB, 100);
-    expect(pending.filter((p) => p.tunnelName === 'LEDGER_A').map((p) => `${p.direction}|${p.ts}`)).toEqual([`ingress|${holeA}`]);
+    const pending = await getPendingGapBuckets(DB, 100);
+    expect(pending.filter((p) => p.ts.startsWith('2026-09-01T10:')).map((p) => p.ts)).toEqual([holeA]);
 
     const hourly = await DB.prepare('SELECT sample_count FROM tunnel_metrics_hourly WHERE tunnel_name = ? AND direction = ? AND ts = ?')
       .bind('LEDGER_A', 'ingress', '2026-09-01T10:00:00.000Z').first<{ sample_count: number }>();
@@ -60,9 +60,9 @@ describe('reconcileHours', () => {
     const lines = (await obj!.text()).trim().split('\n');
     expect(lines[0]).toBe('tunnel_name,direction,ts,bit_rate');
     expect(lines.filter((l) => l.startsWith('LEDGER_A,ingress,'))).toHaveLength(11);
-    expect(lines.filter((l) => l.startsWith('LEDGER_A,egress,'))).toHaveLength(12);
+    expect(lines.filter((l) => l.startsWith('LEDGER_A,egress,'))).toHaveLength(11);
 
-    await deleteResolvedGaps(DB, [{ tunnelName: 'LEDGER_A', direction: 'ingress', ts: holeA }]);
+    await deleteResolvedGapBuckets(DB, [{ ts: holeA }]);
   });
 
   it('is idempotent: a second run at the same time changes nothing', async () => {
