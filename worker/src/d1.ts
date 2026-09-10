@@ -752,6 +752,12 @@ export async function setMetadata(db: D1Database, key: string, value: string): P
   await db.prepare('INSERT OR REPLACE INTO cron_metadata (key, value) VALUES (?, ?)').bind(key, value).run();
 }
 
+// cron_metadata is a few dozen rows; one read is cheaper than a key list.
+export async function getAllMetadata(db: D1Database): Promise<Record<string, string>> {
+  const { results } = await db.prepare('SELECT key, value FROM cron_metadata').all<{ key: string; value: string }>();
+  return Object.fromEntries(results.map((r) => [r.key, r.value]));
+}
+
 const MAX_ERROR_MESSAGE_CHARS = 500;
 
 // Never throws — this runs inside the cron's own catch blocks, and a failure
@@ -761,10 +767,15 @@ export async function recordCronError(db: D1Database, step: CronStep, err: unkno
   console.error(`Cron step ${step} failed: ${message}`);
   const upsert = 'INSERT OR REPLACE INTO cron_metadata (key, value) VALUES (?, ?)';
   try {
+    const at = new Date().toISOString();
     await db.batch([
-      db.prepare(upsert).bind('last_error_at', new Date().toISOString()),
+      // Most recent error overall (existing consumers) …
+      db.prepare(upsert).bind('last_error_at', at),
       db.prepare(upsert).bind('last_error_step', step),
       db.prepare(upsert).bind('last_error_message', message),
+      // … and per step, so an hourly failure cannot mask a daily one.
+      db.prepare(upsert).bind(`last_error_${step}_at`, at),
+      db.prepare(upsert).bind(`last_error_${step}_message`, message),
     ]);
   } catch (writeErr) {
     const writeMessage = writeErr instanceof Error ? writeErr.message : String(writeErr);

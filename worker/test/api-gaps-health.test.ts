@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import { env } from 'cloudflare:workers';
 import { handleApiRequest } from '../src/api';
-import { insertGapCells, incrementOrConfirmGaps, setMetadata } from '../src/d1';
+import { insertGapBuckets, incrementOrConfirmGapBuckets, setMetadata, recordCronError } from '../src/d1';
 import { applyTestSchema } from './helpers/schema';
 
 const DB = (env as { DB: D1Database }).DB;
@@ -10,10 +10,12 @@ const TEST_ENV = { DB, RAW_METRICS: BUCKET, WAN_API_TOKEN: 'token', ACCOUNT_ID: 
 
 type Cell = { tunnel_name: string; direction: string; ts: string; status: string; attempts: number; first_detected: string; confirmed_empty_at: string | null };
 type GapsBody = { start: string; end: string; pending: number; confirmed_empty: number; truncated: boolean; cells: Cell[] };
+type StepError = { at: string; message: string } | null;
 type HealthBody = {
   last_cron_run: string | null; last_tunnel_count: number | null; last_full_run_at: string | null;
   last_full_run_ok: boolean | null; reconciled_through: string | null; hours_behind: number | null;
   pending_gaps: number; confirmed_empty_7d: number; last_error: { at: string; step: string; message: string } | null;
+  step_errors: Record<'collect' | 'retry' | 'reconcile' | 'billing' | 'purge_d1' | 'purge_r2', StepError>;
 };
 
 async function get(path: string): Promise<Response> {
@@ -22,36 +24,34 @@ async function get(path: string): Promise<Response> {
 
 beforeAll(async () => {
   await applyTestSchema(DB);
-  const pendingCell = { tunnelName: 'GAP_P', direction: 'ingress' as const, ts: '2026-09-01T10:05:00Z' };
-  const confirmedCell = { tunnelName: 'GAP_C', direction: 'egress' as const, ts: '2026-09-01T10:10:00Z' };
-  await insertGapCells(DB, [pendingCell, confirmedCell], '2026-09-01T12:01:00Z');
+  await insertGapBuckets(DB, [{ ts: '2026-09-01T10:05:00Z' }, { ts: '2026-09-01T10:10:00Z' }], '2026-09-01T12:01:00Z');
   for (const at of ['2026-09-01T13:01:00Z', '2026-09-01T14:01:00Z', '2026-09-01T15:01:00Z']) {
-    await incrementOrConfirmGaps(DB, [confirmedCell], at);
+    await incrementOrConfirmGapBuckets(DB, [{ ts: '2026-09-01T10:10:00Z' }], at);
   }
 });
 
 describe('/api/gaps', () => {
-  it('lists cells in range with status and counts', async () => {
+  it('lists buckets in range with the legacy cell shape and "*" sentinels', async () => {
     const res = await get('/api/gaps?start=2026-09-01T10:00:00Z&end=2026-09-01T11:00:00Z');
     expect(res.status).toBe(200);
     const body = await res.json() as GapsBody;
 
-    const ours = body.cells.filter((c) => c.tunnel_name.startsWith('GAP_'));
-    expect(ours).toEqual([
-      { tunnel_name: 'GAP_P', direction: 'ingress', ts: '2026-09-01T10:05:00Z', status: 'pending', attempts: 0, first_detected: '2026-09-01T12:01:00Z', confirmed_empty_at: null },
-      { tunnel_name: 'GAP_C', direction: 'egress', ts: '2026-09-01T10:10:00Z', status: 'confirmed_empty', attempts: 3, first_detected: '2026-09-01T12:01:00Z', confirmed_empty_at: '2026-09-01T15:01:00Z' },
+    expect(body.cells).toEqual([
+      { tunnel_name: '*', direction: '*', ts: '2026-09-01T10:05:00Z', status: 'pending', attempts: 0, first_detected: '2026-09-01T12:01:00Z', confirmed_empty_at: null },
+      { tunnel_name: '*', direction: '*', ts: '2026-09-01T10:10:00Z', status: 'confirmed_empty', attempts: 3, first_detected: '2026-09-01T12:01:00Z', confirmed_empty_at: '2026-09-01T15:01:00Z' },
     ]);
-    expect(body.pending).toBeGreaterThanOrEqual(1);
-    expect(body.confirmed_empty).toBeGreaterThanOrEqual(1);
+    expect(body.pending).toBe(1);
+    expect(body.confirmed_empty).toBe(1);
     expect(body.truncated).toBe(false);
   });
 
-  it('filters by tunnel and by status', async () => {
-    const byTunnel = await (await get('/api/gaps?start=2026-09-01T10:00:00Z&end=2026-09-01T11:00:00Z&tunnel=GAP_C')).json() as GapsBody;
-    expect(byTunnel.cells.map((c) => c.tunnel_name)).toEqual(['GAP_C']);
+  it('filters by status and ignores the legacy tunnel filter', async () => {
+    const byTunnel = await (await get('/api/gaps?start=2026-09-01T10:00:00Z&end=2026-09-01T11:00:00Z&tunnel=ANY')).json() as GapsBody;
+    expect(byTunnel.cells).toHaveLength(2);
 
     const byStatus = await (await get('/api/gaps?start=2026-09-01T10:00:00Z&end=2026-09-01T11:00:00Z&status=pending')).json() as GapsBody;
-    expect(byStatus.cells.filter((c) => c.tunnel_name.startsWith('GAP_')).map((c) => c.tunnel_name)).toEqual(['GAP_P']);
+    expect(byStatus.cells.map((c) => c.ts)).toEqual(['2026-09-01T10:05:00Z']);
+    expect(byStatus.confirmed_empty).toBe(1);
   });
 
   it('rejects a missing range, a bad status, a span over 7 days, and end <= start', async () => {
@@ -73,17 +73,17 @@ describe('/api/health', () => {
     expect(body.reconciled_through).toBeNull();
     expect(body.hours_behind).toBeNull();
     expect(body.last_error).toBeNull();
+    expect(body.step_errors).toEqual({ collect: null, retry: null, reconcile: null, billing: null, purge_d1: null, purge_r2: null });
   });
 
-  it('reflects metadata keys, computes hours_behind, and counts gaps', async () => {
+  it('reflects metadata keys, computes hours_behind, counts buckets, and exposes per-step errors', async () => {
     await applyTestSchema(DB);
     await setMetadata(DB, 'last_cron_run', '2026-09-03T13:35:00.000Z');
     await setMetadata(DB, 'last_tunnel_count', '8');
     await setMetadata(DB, 'last_full_run_at', '2026-09-03T13:01:00.000Z');
     await setMetadata(DB, 'last_full_run_ok', 'false');
-    await setMetadata(DB, 'last_error_at', '2026-09-03T13:01:30.000Z');
-    await setMetadata(DB, 'last_error_step', 'collect');
-    await setMetadata(DB, 'last_error_message', 'all 13 slice(s) failed');
+    await recordCronError(DB, 'billing', new Error('r2 exploded'));
+    await recordCronError(DB, 'collect', new Error('all 13 slice(s) failed'));
     // Watermark exactly 7 hours before the current hour boundary, so
     // now - 2h - watermark is in [5h, 6h) and floors to 5 at any wall-clock.
     const HOUR = 60 * 60 * 1000;
@@ -97,6 +97,9 @@ describe('/api/health', () => {
     expect(body.last_full_run_ok).toBe(false);
     expect(body.hours_behind).toBe(5);
     expect(body.pending_gaps).toBeGreaterThanOrEqual(1);
-    expect(body.last_error).toEqual({ at: '2026-09-03T13:01:30.000Z', step: 'collect', message: 'all 13 slice(s) failed' });
+    expect(body.last_error).toMatchObject({ step: 'collect', message: 'all 13 slice(s) failed' });
+    expect(body.step_errors.collect).toMatchObject({ message: 'all 13 slice(s) failed' });
+    expect(body.step_errors.billing).toMatchObject({ message: 'r2 exploded' });
+    expect(body.step_errors.reconcile).toBeNull();
   });
 });

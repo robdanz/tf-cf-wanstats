@@ -1,4 +1,4 @@
-import type { Env, TunnelStat } from './types';
+import type { Env, TunnelStat, CronStep } from './types';
 import { verifyToken, rangeToSince, rangeToUntil, rangeToTable, tableToStepSeconds, snapToStep } from './utils';
 import {
   buildPaginatedTunnelsSql,
@@ -9,10 +9,10 @@ import {
   getBillingP95Summary,
   getBillingP95Tunnels,
   storeTunnelMetrics,
-  getGapCells,
-  getGapCounts,
-  getGapRangeCounts,
-  getMetadata,
+  getGapBuckets,
+  getGapBucketCounts,
+  getGapBucketRangeCounts,
+  getAllMetadata,
   CURRENT_METRICS_SQL,
   CHANGED_SINCE_SQL,
   CHANGED_SINCE_GROUP_SQL,
@@ -288,65 +288,76 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
     if (statusParam !== null && statusParam !== 'pending' && statusParam !== 'confirmed_empty') {
       return new Response('status must be pending or confirmed_empty', { status: 400 });
     }
-    const tunnel = url.searchParams.get('tunnel');
+    // `tunnel` is accepted for compatibility and ignored: gaps are tracked
+    // per bucket and a bucket gap applies to every tunnel.
 
     // Raw ts format bounds (no milliseconds).
     const start = startDate.toISOString().slice(0, 19) + 'Z';
     const end = endDate.toISOString().slice(0, 19) + 'Z';
-    const cells = await getGapCells(env.DB, start, end, tunnel, statusParam, GAPS_MAX_ROWS + 1);
-    const truncated = cells.length > GAPS_MAX_ROWS;
-    const page = truncated ? cells.slice(0, GAPS_MAX_ROWS) : cells;
+    const buckets = await getGapBuckets(env.DB, start, end, statusParam, GAPS_MAX_ROWS + 1);
+    const truncated = buckets.length > GAPS_MAX_ROWS;
+    const page = truncated ? buckets.slice(0, GAPS_MAX_ROWS) : buckets;
 
     // Range totals, not page-local counts: the status filter narrows the
-    // returned cells but must not change what pending/confirmed_empty report.
-    const { pending, confirmedEmpty } = await getGapRangeCounts(env.DB, start, end, tunnel);
+    // returned rows but must not change what pending/confirmed_empty report.
+    const { pending, confirmedEmpty } = await getGapBucketRangeCounts(env.DB, start, end);
 
+    // Legacy cell shape with "*" sentinels so existing consumers keep working.
     return Response.json({
       start, end, pending, confirmed_empty: confirmedEmpty, truncated,
-      cells: page.map((c) => ({
-        tunnel_name: c.tunnel_name,
-        direction: c.direction,
-        ts: c.ts,
-        status: c.confirmed_empty_at === null ? 'pending' : 'confirmed_empty',
-        attempts: c.attempts,
-        first_detected: c.first_detected,
-        confirmed_empty_at: c.confirmed_empty_at,
+      cells: page.map((b) => ({
+        tunnel_name: '*',
+        direction: '*',
+        ts: b.ts,
+        status: b.confirmed_empty_at === null ? 'pending' : 'confirmed_empty',
+        attempts: b.attempts,
+        first_detected: b.first_detected,
+        confirmed_empty_at: b.confirmed_empty_at,
       })),
     }, { headers: { 'Cache-Control': 'no-store' } });
   }
 
   if (pathname === '/api/health') {
     const now = new Date();
-    const keys = [
-      'last_cron_run', 'last_tunnel_count', 'last_full_run_at', 'last_full_run_ok',
-      'reconciled_through', 'last_error_at', 'last_error_step', 'last_error_message',
-    ] as const;
-    const values = await Promise.all(keys.map((k) => getMetadata(env.DB, k)));
-    const meta = Object.fromEntries(keys.map((k, i) => [k, values[i]])) as Record<typeof keys[number], string | null>;
+    const meta = await getAllMetadata(env.DB);
+    const get = (k: string): string | null => meta[k] ?? null;
 
-    const reconciledThrough = meta.reconciled_through;
+    const reconciledThrough = get('reconciled_through');
     const hoursBehind = reconciledThrough === null
       ? null
       : Math.max(0, Math.floor((now.getTime() - 2 * 60 * 60 * 1000 - new Date(reconciledThrough).getTime()) / (60 * 60 * 1000)));
 
     const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString();
-    const counts = await getGapCounts(env.DB, sevenDaysAgo);
+    const counts = await getGapBucketCounts(env.DB, sevenDaysAgo);
 
+    // Per-step last error: last_error_* alone is overwritten by whichever
+    // step failed most recently, so an hourly reconcile failure would hide a
+    // midnight billing one.
+    const steps: CronStep[] = ['collect', 'retry', 'reconcile', 'billing', 'purge_d1', 'purge_r2'];
+    const stepErrors = Object.fromEntries(steps.map((s) => {
+      const at = get(`last_error_${s}_at`);
+      return [s, at === null ? null : { at, message: get(`last_error_${s}_message`) }];
+    }));
+
+    const lastTunnelCount = get('last_tunnel_count');
+    const lastFullRunOk = get('last_full_run_ok');
+    const lastErrorAt = get('last_error_at');
     return Response.json({
       generated_at: now.toISOString(),
-      last_cron_run: meta.last_cron_run,
-      last_tunnel_count: meta.last_tunnel_count === null ? null : parseInt(meta.last_tunnel_count, 10),
-      last_full_run_at: meta.last_full_run_at,
-      last_full_run_ok: meta.last_full_run_ok === null ? null : meta.last_full_run_ok === 'true',
+      last_cron_run: get('last_cron_run'),
+      last_tunnel_count: lastTunnelCount === null ? null : parseInt(lastTunnelCount, 10),
+      last_full_run_at: get('last_full_run_at'),
+      last_full_run_ok: lastFullRunOk === null ? null : lastFullRunOk === 'true',
       reconciled_through: reconciledThrough,
       hours_behind: hoursBehind,
       pending_gaps: counts.pending,
       confirmed_empty_7d: counts.confirmedEmpty,
-      last_error: meta.last_error_at === null ? null : {
-        at: meta.last_error_at,
-        step: meta.last_error_step,
-        message: meta.last_error_message,
+      last_error: lastErrorAt === null ? null : {
+        at: lastErrorAt,
+        step: get('last_error_step'),
+        message: get('last_error_message'),
       },
+      step_errors: stepErrors,
     }, { headers: { 'Cache-Control': 'no-store' } });
   }
 
