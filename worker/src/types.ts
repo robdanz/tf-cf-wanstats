@@ -53,6 +53,18 @@ export interface TrackedGapCell extends GapCell {
   firstDetected: string;
 }
 
+// A 5-min bucket with no raw rows in either direction. Gaps are whole-bucket
+// events (a failed GraphQL slice affects every tunnel), so this is the unit
+// of tracking; per-tunnel absence is normal for idle tunnels.
+export interface GapBucket {
+  ts: string;
+}
+
+export interface TrackedGapBucket extends GapBucket {
+  attempts: number;
+  firstDetected: string;
+}
+
 export interface TunnelStat {
   tunnel_name: string;
   p95_ingress_bps: number | null;
@@ -67,4 +79,4 @@ export interface BillingP95Result {
   computed_at: string;
 }
 
-export type CronStep = 'collect' | 'retry' | 'reconcile' | 'daily';
+export type CronStep = 'collect' | 'retry' | 'reconcile' | 'daily' | 'billing' | 'purge_d1' | 'purge_r2';
