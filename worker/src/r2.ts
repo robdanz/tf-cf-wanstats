@@ -28,6 +28,48 @@ export function buildCsvLines(rows: NormalizedRow[], direction: 'ingress' | 'egr
   return rows.map((r) => `${r.tunnelName},${direction},${r.ts},${r.bitRate}`);
 }
 
+// Cron invocations overlap (a full run's ledger can still be walking when the
+// :05 light run starts), and several writers touch the same hour file: collect,
+// gap retry, the ledger's rebuild-from-D1, backfill. A plain read-merge-put
+// loses whichever writer finishes first. Guard the put with the etag we read
+// (or "must not exist" when we read nothing): R2 returns null instead of
+// writing when the precondition fails, and we re-read — now seeing the other
+// writer's rows — and merge again, so the outcome is the union by key.
+//
+// Create-if-absent relies on etagDoesNotMatch: '*'. If R2 does not honour the
+// wildcard the create path degrades to today's unconditional behaviour for a
+// file's first write only; every later write is still protected.
+const MAX_PUT_ATTEMPTS = 5;
+
+async function mergeIntoHourFile(
+  bucket: R2Bucket,
+  objectKey: string,
+  incoming: Map<string, string>,
+): Promise<number> {
+  for (let attempt = 1; attempt <= MAX_PUT_ATTEMPTS; attempt++) {
+    const existingObj = await bucket.get(objectKey);
+    const merged = existingObj
+      ? collapseMaxPerKey(await existingObj.text()).lines
+      : new Map<string, string>();
+
+    for (const [lineKey, line] of incoming) merged.set(lineKey, line);
+
+    const allLines = Array.from(merged.values()).sort();
+    const csv = CSV_HEADER + '\n' + allLines.join('\n') + '\n';
+
+    const onlyIf: R2Conditional = existingObj
+      ? { etagMatches: existingObj.etag }
+      : { etagDoesNotMatch: '*' };
+    const stored = await bucket.put(objectKey, csv, { onlyIf });
+    if (stored !== null) return allLines.length;
+
+    console.warn(`R2 ${objectKey}: concurrent write detected, re-merging (attempt ${attempt}/${MAX_PUT_ATTEMPTS})`);
+  }
+  // Loud failure over silent loss: the caller's step records the error and
+  // the ledger will rebuild this hour from D1 on a later run.
+  throw new Error(`R2 ${objectKey}: gave up after ${MAX_PUT_ATTEMPTS} concurrent-write retries`);
+}
+
 export async function writeRawToR2(
   bucket: R2Bucket,
   ingress: NormalizedRow[],
@@ -55,24 +97,9 @@ export async function writeRawToR2(
   addRows(egress, 'egress');
 
   let totalRows = 0;
-  const writes: Promise<void>[] = [];
-
   for (const [key, incoming] of hourBuckets) {
-    const existingObj = await bucket.get(`raw/${key}.csv`);
-    const merged = existingObj
-      ? collapseMaxPerKey(await existingObj.text()).lines
-      : new Map<string, string>();
-
-    for (const [lineKey, line] of incoming) merged.set(lineKey, line);
-
-    const allLines = Array.from(merged.values()).sort();
-    totalRows += allLines.length;
-    const csv = CSV_HEADER + '\n' + allLines.join('\n') + '\n';
-
-    writes.push(bucket.put(`raw/${key}.csv`, csv).then(() => {}));
+    totalRows += await mergeIntoHourFile(bucket, `raw/${key}.csv`, incoming);
   }
-
-  await Promise.all(writes);
 
   return { filesWritten: hourBuckets.size, totalRows };
 }

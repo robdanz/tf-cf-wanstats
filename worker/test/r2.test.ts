@@ -59,3 +59,71 @@ describe('writeRawToR2 replace-by-key merge', () => {
     ]);
   });
 });
+
+// Wraps the real bucket so that the first get() of `key` runs `between()`
+// after reading and before returning — i.e. another writer lands between our
+// read and our put, which is the lost-update race an unconditional put loses.
+function bucketWithWriterBetweenReadAndPut(real: R2Bucket, key: string, between: () => Promise<void>): R2Bucket {
+  let fired = false;
+  return new Proxy(real, {
+    get(target, prop, receiver) {
+      if (prop === 'get') {
+        return async (k: string, opts?: R2GetOptions) => {
+          const obj = await target.get(k, opts);
+          if (k === key && !fired) {
+            fired = true;
+            await between();
+          }
+          return obj;
+        };
+      }
+      const v = Reflect.get(target, prop, receiver);
+      return typeof v === 'function' ? v.bind(target) : v;
+    },
+  });
+}
+
+describe('writeRawToR2 concurrent writers', () => {
+  it('keeps rows from a writer that lands between our read and our put on an existing file', async () => {
+    const key = 'raw/2026-02-01/08.csv';
+    await writeRawToR2(BUCKET, [row('TUN_R', '2026-02-01T08:00:00Z', 1)], []);
+
+    const racing = bucketWithWriterBetweenReadAndPut(BUCKET, key, async () => {
+      await writeRawToR2(BUCKET, [row('TUN_OTHER', '2026-02-01T08:05:00Z', 2)], []);
+    });
+    await writeRawToR2(racing, [row('TUN_R', '2026-02-01T08:10:00Z', 3)], []);
+
+    const lines = await readCsv(key);
+    expect(lines).toEqual([
+      'TUN_OTHER,ingress,2026-02-01T08:05:00Z,2',
+      'TUN_R,ingress,2026-02-01T08:00:00Z,1',
+      'TUN_R,ingress,2026-02-01T08:10:00Z,3',
+    ]);
+  });
+
+  it('keeps rows from a writer that creates the file between our read (absent) and our put', async () => {
+    const key = 'raw/2026-02-02/08.csv';
+    const racing = bucketWithWriterBetweenReadAndPut(BUCKET, key, async () => {
+      await writeRawToR2(BUCKET, [row('TUN_FIRST', '2026-02-02T08:00:00Z', 10)], []);
+    });
+    await writeRawToR2(racing, [row('TUN_SECOND', '2026-02-02T08:05:00Z', 20)], []);
+
+    const lines = await readCsv(key);
+    expect(lines).toEqual([
+      'TUN_FIRST,ingress,2026-02-02T08:00:00Z,10',
+      'TUN_SECOND,ingress,2026-02-02T08:05:00Z,20',
+    ]);
+  });
+
+  it('throws instead of silently dropping rows when the precondition keeps failing', async () => {
+    const alwaysLosing = new Proxy(BUCKET, {
+      get(target, prop, receiver) {
+        if (prop === 'put') return async () => null;
+        const v = Reflect.get(target, prop, receiver);
+        return typeof v === 'function' ? v.bind(target) : v;
+      },
+    });
+    await expect(writeRawToR2(alwaysLosing, [row('TUN_LOSE', '2026-02-03T08:00:00Z', 1)], []))
+      .rejects.toThrow(/raw\/2026-02-03\/08\.csv/);
+  });
+});
