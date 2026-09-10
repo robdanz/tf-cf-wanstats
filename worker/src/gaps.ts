@@ -1,7 +1,7 @@
-import type { Env, GapCell, TrackedGapCell, NormalizedRow } from './types';
+import type { Env, GapBucket, TrackedGapBucket, NormalizedRow } from './types';
 import { fetchMetricsTimeSliced } from './graphql';
 import {
-  getPendingGaps, deleteResolvedGaps, incrementOrConfirmGaps, storeTunnelMetrics,
+  getPendingGapBuckets, deleteResolvedGapBuckets, incrementOrConfirmGapBuckets, storeTunnelMetrics,
   rollupHour, rollupDay,
 } from './d1';
 import { writeRawToR2 } from './r2';
@@ -12,60 +12,52 @@ import { snapToHour, snapToDay } from './utils';
 // arbitrarily many buckets) are the wrong unit to cap on.
 const MAX_BUCKETS_PER_RUN = 20;
 const FIVE_MINUTES_MS = 5 * 60 * 1000;
-// Max *distinct timestamps* pulled from gap_tracking per run — every cell for
-// a selected ts comes back, since one GraphQL call covers all tunnels for it.
-const MAX_PENDING_TIMESTAMPS = 500;
+// Max pending buckets pulled from gap_buckets per run (oldest first).
+const MAX_PENDING_BUCKETS = 500;
 
 export interface ContiguousRange {
   start: string;
   end: string;
-  cells: TrackedGapCell[];
+  buckets: TrackedGapBucket[];
 }
 
-export function groupIntoContiguousRanges(cells: TrackedGapCell[]): ContiguousRange[] {
-  const byTs = new Map<string, TrackedGapCell[]>();
-  for (const cell of cells) {
-    if (!byTs.has(cell.ts)) byTs.set(cell.ts, []);
-    byTs.get(cell.ts)!.push(cell);
-  }
-
-  const sortedTs = Array.from(byTs.keys()).sort();
+export function groupIntoContiguousRanges(buckets: TrackedGapBucket[]): ContiguousRange[] {
+  const sorted = [...buckets].sort((a, b) => a.ts.localeCompare(b.ts));
   const ranges: ContiguousRange[] = [];
-  let currentTsList: string[] = [];
+  let current: TrackedGapBucket[] = [];
 
-  for (const ts of sortedTs) {
-    const last = currentTsList[currentTsList.length - 1];
-    if (last !== undefined && new Date(ts).getTime() - new Date(last).getTime() === FIVE_MINUTES_MS) {
-      currentTsList.push(ts);
+  for (const bucket of sorted) {
+    const last = current[current.length - 1];
+    if (last !== undefined && new Date(bucket.ts).getTime() - new Date(last.ts).getTime() === FIVE_MINUTES_MS) {
+      current.push(bucket);
     } else {
-      if (currentTsList.length > 0) ranges.push(finalizeRange(currentTsList, byTs));
-      currentTsList = [ts];
+      if (current.length > 0) ranges.push(finalizeRange(current));
+      current = [bucket];
     }
   }
-  if (currentTsList.length > 0) ranges.push(finalizeRange(currentTsList, byTs));
+  if (current.length > 0) ranges.push(finalizeRange(current));
 
-  // reduce(), not Math.min(...spread) — a very large cell array would blow the
+  // reduce(), not Math.min(...spread) — a very large array would blow the
   // argument limit and throw RangeError.
-  const earliest = (cells: TrackedGapCell[]) =>
-    cells.reduce((min, c) => Math.min(min, new Date(c.firstDetected).getTime()), Infinity);
-  ranges.sort((a, b) => earliest(a.cells) - earliest(b.cells));
+  const earliest = (bs: TrackedGapBucket[]) =>
+    bs.reduce((min, b) => Math.min(min, new Date(b.firstDetected).getTime()), Infinity);
+  ranges.sort((a, b) => earliest(a.buckets) - earliest(b.buckets));
 
   return ranges;
 }
 
-function finalizeRange(tsList: string[], byTs: Map<string, TrackedGapCell[]>): ContiguousRange {
-  const cells = tsList.flatMap((ts) => byTs.get(ts)!);
-  const start = tsList[0];
-  const endMs = new Date(tsList[tsList.length - 1]).getTime() + FIVE_MINUTES_MS;
+function finalizeRange(buckets: TrackedGapBucket[]): ContiguousRange {
+  const start = buckets[0].ts;
+  const endMs = new Date(buckets[buckets.length - 1].ts).getTime() + FIVE_MINUTES_MS;
   // Raw ts format has no milliseconds ('...Z', not '...000Z'); inputs are
   // always 5-min-aligned so the millisecond component is always exactly
   // zero here — safe to strip rather than reformat by hand.
   const end = new Date(endMs).toISOString().replace('.000Z', 'Z');
-  return { start, end, cells };
+  return { start, end, buckets };
 }
 
 export async function retryPendingGaps(env: Env, now: Date): Promise<void> {
-  const pending = await getPendingGaps(env.DB, MAX_PENDING_TIMESTAMPS);
+  const pending = await getPendingGapBuckets(env.DB, MAX_PENDING_BUCKETS);
   if (pending.length === 0) return;
 
   const ranges = groupIntoContiguousRanges(pending);
@@ -75,10 +67,9 @@ export async function retryPendingGaps(env: Env, now: Date): Promise<void> {
   const toProcess: ContiguousRange[] = [];
   let bucketCount = 0;
   for (const range of ranges) {
-    const rangeBuckets = (new Date(range.end).getTime() - new Date(range.start).getTime()) / FIVE_MINUTES_MS;
-    if (toProcess.length > 0 && bucketCount + rangeBuckets > MAX_BUCKETS_PER_RUN) break;
+    if (toProcess.length > 0 && bucketCount + range.buckets.length > MAX_BUCKETS_PER_RUN) break;
     toProcess.push(range);
-    bucketCount += rangeBuckets;
+    bucketCount += range.buckets.length;
   }
   if (ranges.length > toProcess.length) {
     console.warn(`Gap repoll: deferring ${ranges.length - toProcess.length} window(s) to next run (budget cap)`);
@@ -100,7 +91,7 @@ export async function retryPendingGaps(env: Env, now: Date): Promise<void> {
       continue;
     }
     // failedSlices carries toISOString() timestamps; raw ts has no
-    // milliseconds. Normalise once so the per-cell check is a plain lookup.
+    // milliseconds. Normalise once so the per-bucket check is a plain lookup.
     const failedTs = new Set(failedSlices.map((s) => s.replace('.000Z', 'Z')));
 
     await Promise.all([
@@ -109,34 +100,29 @@ export async function retryPendingGaps(env: Env, now: Date): Promise<void> {
     ]);
     await writeRawToR2(env.RAW_METRICS, ingress, egress);
 
-    const present = new Map<string, Set<string>>();
-    for (const row of ingress) {
-      if (!present.has(row.ts)) present.set(row.ts, new Set());
-      present.get(row.ts)!.add(`${row.tunnelName}|ingress`);
-    }
-    for (const row of egress) {
-      if (!present.has(row.ts)) present.set(row.ts, new Set());
-      present.get(row.ts)!.add(`${row.tunnelName}|egress`);
-    }
+    // Any row in either direction resolves the bucket: the slice returned
+    // data, so its absence was a fetch problem, not a Cloudflare-side hole.
+    const presentTs = new Set<string>();
+    for (const row of ingress) presentTs.add(row.ts);
+    for (const row of egress) presentTs.add(row.ts);
 
-    const resolved: GapCell[] = [];
-    const stillMissing: GapCell[] = [];
+    const resolved: GapBucket[] = [];
+    const stillMissing: GapBucket[] = [];
     let skipped = 0;
-    for (const cell of range.cells) {
-      // A failed slice says nothing about the cell: no resolve, no attempt burned.
-      if (failedTs.has(cell.ts)) { skipped++; continue; }
-      const key = `${cell.tunnelName}|${cell.direction}`;
-      if (present.get(cell.ts)?.has(key)) {
-        resolved.push(cell);
-        resolvedHours.add(snapToHour(new Date(cell.ts)).toISOString());
-        resolvedDays.add(snapToDay(new Date(cell.ts)).toISOString());
+    for (const bucket of range.buckets) {
+      // A failed slice says nothing about the bucket: no resolve, no attempt burned.
+      if (failedTs.has(bucket.ts)) { skipped++; continue; }
+      if (presentTs.has(bucket.ts)) {
+        resolved.push(bucket);
+        resolvedHours.add(snapToHour(new Date(bucket.ts)).toISOString());
+        resolvedDays.add(snapToDay(new Date(bucket.ts)).toISOString());
       } else {
-        stillMissing.push(cell);
+        stillMissing.push(bucket);
       }
     }
 
-    if (resolved.length > 0) await deleteResolvedGaps(env.DB, resolved);
-    if (stillMissing.length > 0) await incrementOrConfirmGaps(env.DB, stillMissing, now.toISOString());
+    if (resolved.length > 0) await deleteResolvedGapBuckets(env.DB, resolved);
+    if (stillMissing.length > 0) await incrementOrConfirmGapBuckets(env.DB, stillMissing, now.toISOString());
 
     console.log(`Gap repoll ${range.start}-${range.end}: resolved ${resolved.length}, still missing ${stillMissing.length}, skipped (slice failed) ${skipped}`);
   }
