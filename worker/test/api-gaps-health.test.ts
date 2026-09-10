@@ -25,7 +25,7 @@ async function get(path: string): Promise<Response> {
 beforeAll(async () => {
   await applyTestSchema(DB);
   await insertGapBuckets(DB, [{ ts: '2026-09-01T10:05:00Z' }, { ts: '2026-09-01T10:10:00Z' }], '2026-09-01T12:01:00Z');
-  for (const at of ['2026-09-01T13:01:00Z', '2026-09-01T14:01:00Z', '2026-09-01T15:01:00Z']) {
+  for (const at of ['2026-09-01T13:01:00Z', '2026-09-01T14:01:00Z', '2026-09-01T15:01:00Z', '2026-09-01T16:01:00Z', '2026-09-01T17:01:00Z']) {
     await incrementOrConfirmGapBuckets(DB, [{ ts: '2026-09-01T10:10:00Z' }], at);
   }
 });
@@ -38,7 +38,7 @@ describe('/api/gaps', () => {
 
     expect(body.cells).toEqual([
       { tunnel_name: '*', direction: '*', ts: '2026-09-01T10:05:00Z', status: 'pending', attempts: 0, first_detected: '2026-09-01T12:01:00Z', confirmed_empty_at: null },
-      { tunnel_name: '*', direction: '*', ts: '2026-09-01T10:10:00Z', status: 'confirmed_empty', attempts: 3, first_detected: '2026-09-01T12:01:00Z', confirmed_empty_at: '2026-09-01T15:01:00Z' },
+      { tunnel_name: '*', direction: '*', ts: '2026-09-01T10:10:00Z', status: 'confirmed_empty', attempts: 5, first_detected: '2026-09-01T12:01:00Z', confirmed_empty_at: '2026-09-01T17:01:00Z' },
     ]);
     expect(body.pending).toBe(1);
     expect(body.confirmed_empty).toBe(1);

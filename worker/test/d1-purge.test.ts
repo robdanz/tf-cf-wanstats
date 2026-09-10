@@ -62,18 +62,21 @@ describe('purgeOldData rollup retention', () => {
 });
 
 describe('purgeOldData gap_buckets retention', () => {
-  it('deletes a bucket whose ts predates raw retention regardless of status, keeps recent ones', async () => {
-    const oldTs = rawTsAgo(8 * DAY);
+  it('keeps confirmed-empty buckets as a record for 180 days (the daily rollup horizon), then drops them', async () => {
+    const ancientTs = rawTsAgo(200 * DAY);
+    const monthOldTs = rawTsAgo(30 * DAY);
     const recentTs = rawTsAgo(60 * 60 * 1000);
-    await insertGapBuckets(DB, [{ ts: oldTs }, { ts: recentTs }], new Date().toISOString());
-    await DB.prepare('UPDATE gap_buckets SET attempts = 3, confirmed_empty_at = ? WHERE ts = ?').bind(new Date().toISOString(), oldTs).run();
+    await insertGapBuckets(DB, [{ ts: ancientTs }, { ts: monthOldTs }, { ts: recentTs }], new Date().toISOString());
+    await DB.prepare('UPDATE gap_buckets SET attempts = 5, confirmed_empty_at = ? WHERE ts IN (?, ?)')
+      .bind(new Date().toISOString(), ancientTs, monthOldTs).run();
 
     const result = await purgeOldData(DB);
 
     expect(result.gapTrackingDeleted).toBeGreaterThanOrEqual(1);
     const remaining = await DB.prepare('SELECT ts FROM gap_buckets').all<{ ts: string }>();
     const tss = remaining.results.map((r) => r.ts);
-    expect(tss).not.toContain(oldTs);
+    expect(tss).not.toContain(ancientTs);
+    expect(tss).toContain(monthOldTs);
     expect(tss).toContain(recentTs);
   });
 });

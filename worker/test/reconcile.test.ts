@@ -49,7 +49,7 @@ describe('reconcileHours', () => {
     expect(result).toEqual({ processed: 1, hoursBehind: 0, reconciledThrough: '2026-09-01T10:00:00Z' });
     expect(await getMetadata(DB, 'reconciled_through')).toBe('2026-09-01T10:00:00Z');
 
-    const pending = await getPendingGapBuckets(DB, 100);
+    const pending = await getPendingGapBuckets(DB, 100, new Date('2030-01-01T00:00:00Z'));
     expect(pending.filter((p) => p.ts.startsWith('2026-09-01T10:')).map((p) => p.ts)).toEqual([holeA]);
 
     const hourly = await DB.prepare('SELECT sample_count FROM tunnel_metrics_hourly WHERE tunnel_name = ? AND direction = ? AND ts = ?')

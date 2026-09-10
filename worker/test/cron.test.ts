@@ -92,7 +92,7 @@ describe('handleCron full run', () => {
 
     await handleCron(TEST_ENV, new Date('2026-08-13T10:16:00Z')); // minute 16 -> light run
 
-    expect((await getPendingGapBuckets(DB, 100)).find((p) => p.ts === ts)).toBeUndefined();
+    expect((await getPendingGapBuckets(DB, 100, new Date('2030-01-01T00:00:00Z'))).find((p) => p.ts === ts)).toBeUndefined();
   });
 
   it('collect records a failed slice as a pending gap bucket in the same run', async () => {
@@ -110,7 +110,7 @@ describe('handleCron full run', () => {
 
     await handleCron(TEST_ENV, new Date('2026-08-14T10:26:00Z')); // light run, 20-min window: 10:05..10:20
 
-    const pending = await getPendingGapBuckets(DB, 100);
+    const pending = await getPendingGapBuckets(DB, 100, new Date('2030-01-01T00:00:00Z'));
     expect(pending.map((p) => p.ts)).toContain('2026-08-14T10:05:00Z');
     // A partial failure is not a collect error: the rows that did arrive were stored.
     expect(await getMetadata(DB, 'last_error_step')).toBeNull();

@@ -12,7 +12,8 @@ import { snapToHour, snapToDay } from './utils';
 // arbitrarily many buckets) are the wrong unit to cap on.
 const MAX_BUCKETS_PER_RUN = 20;
 const FIVE_MINUTES_MS = 5 * 60 * 1000;
-// Max pending buckets pulled from gap_buckets per run (oldest first).
+// Max pending buckets pulled from gap_buckets per run (oldest first, and
+// only those whose backoff step has elapsed — see GAP_RETRY_SCHEDULE_S).
 const MAX_PENDING_BUCKETS = 500;
 
 export interface ContiguousRange {
@@ -57,7 +58,7 @@ function finalizeRange(buckets: TrackedGapBucket[]): ContiguousRange {
 }
 
 export async function retryPendingGaps(env: Env, now: Date): Promise<void> {
-  const pending = await getPendingGapBuckets(env.DB, MAX_PENDING_BUCKETS);
+  const pending = await getPendingGapBuckets(env.DB, MAX_PENDING_BUCKETS, now);
   if (pending.length === 0) return;
 
   const ranges = groupIntoContiguousRanges(pending);

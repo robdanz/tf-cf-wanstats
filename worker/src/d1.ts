@@ -124,10 +124,12 @@ export async function purgeOldData(db: D1Database): Promise<{
   const rawDeleted = await purgeTableInChunks(db, 'tunnel_metrics', rawCutoff, HOUR_MS, rawTs);
   const hourlyDeleted = await purgeTableInChunks(db, 'tunnel_metrics_hourly', hourlyCutoff, DAY_MS, isoTs);
   const dailyDeleted = await purgeTableInChunks(db, 'tunnel_metrics_daily', dailyCutoff, DAY_MS, isoTs);
-  // A gap bucket whose ts predates raw retention can never be repaired (the
-  // raw rows it would resolve against are gone), so status no longer matters.
-  // At most 2,016 rows; the PK range is enough.
-  const gapResult = await db.prepare('DELETE FROM gap_buckets WHERE ts < ?').bind(rawTs(rawCutoff)).run();
+  // Gap buckets are kept as a record for as long as the daily rollups they
+  // explain (a hole in the 180d chart should be answerable from /api/gaps).
+  // Retries stop on their own after the backoff schedule, well inside raw
+  // retention, so nothing here is still being repaired. ≤288 rows/day worst
+  // case; the PK range is enough.
+  const gapResult = await db.prepare('DELETE FROM gap_buckets WHERE ts < ?').bind(rawTs(dailyCutoff)).run();
 
   return {
     rawDeleted,
@@ -168,10 +170,10 @@ export async function getOldestRawTs(db: D1Database): Promise<string | null> {
 // ── Gap tracking (detect + bounded auto-repoll), per 5-min bucket ───────────
 // See docs/superpowers/specs/2026-09-10-bucket-level-gaps-design.md.
 // A bucket is a gap when no tunnel reported in either direction. Per-tunnel
-// absence is normal (idle tunnels emit no row), so it is not tracked. A row
-// exists only while a bucket is unresolved: resolved buckets are deleted (the
-// raw rows are the record); confirmed_empty_at rows are terminal and excluded
-// from all future discovery.
+// absence is normal (idle tunnels emit no row), so it is not tracked. Resolved
+// buckets are deleted (the raw rows are the record); confirmed_empty_at rows
+// are terminal, excluded from discovery and retry, and kept for 180 days as
+// the record of the hole.
 
 // Twelve 5-min slots per hour, each probed with NOT EXISTS rather than a
 // LEFT JOIN — a join would multiply the slot by every matching raw row before
@@ -212,16 +214,35 @@ export async function insertGapBuckets(db: D1Database, buckets: GapBucket[], now
   }
 }
 
+// Retry backoff: attempt n is eligible once first_detected + schedule[n] has
+// passed. Retrying every 5 minutes gave three strikes inside 15 minutes of
+// discovery — one retry done three times — so any Cloudflare analytics
+// backlog longer than ~2h15m became a permanent, contiguous hole. Spreading
+// the same handful of GraphQL calls over three days keeps a late-arriving
+// window recoverable while the raw rows it resolves into are still within
+// the 7-day retention.
+const HOUR_S = 60 * 60;
+export const GAP_RETRY_SCHEDULE_S = [0, 1 * HOUR_S, 6 * HOUR_S, 24 * HOUR_S, 72 * HOUR_S];
+export const MAX_GAP_ATTEMPTS = GAP_RETRY_SCHEDULE_S.length;
+const GAP_RETRY_OFFSET_SQL =
+  'CASE attempts ' + GAP_RETRY_SCHEDULE_S.map((sec, n) => `WHEN ${n} THEN ${sec}`).join(' ') + ' ELSE 0 END';
+
 // Oldest first_detected first. Rows are buckets, so a plain LIMIT is the
 // bucket budget (unlike the per-cell version, which had to cap by distinct ts).
-export async function getPendingGapBuckets(db: D1Database, limit: number): Promise<TrackedGapBucket[]> {
+// The table is at most a few thousand rows, so the strftime arithmetic on
+// first_detected is fine here (never do this on tunnel_metrics). Both sides
+// are CAST: strftime returns TEXT, and SQLite orders every INTEGER below
+// every TEXT, so an uncast comparison is always true.
+export async function getPendingGapBuckets(db: D1Database, limit: number, now: Date): Promise<TrackedGapBucket[]> {
   const { results } = await db.prepare(`
     SELECT ts, attempts, first_detected
     FROM gap_buckets
-    WHERE confirmed_empty_at IS NULL AND attempts < 3
+    WHERE confirmed_empty_at IS NULL
+      AND attempts < ?1
+      AND CAST(strftime('%s', first_detected) AS INTEGER) + ${GAP_RETRY_OFFSET_SQL} <= CAST(strftime('%s', ?2) AS INTEGER)
     ORDER BY first_detected ASC, ts ASC
-    LIMIT ?
-  `).bind(limit).all<{ ts: string; attempts: number; first_detected: string }>();
+    LIMIT ?3
+  `).bind(MAX_GAP_ATTEMPTS, now.toISOString(), limit).all<{ ts: string; attempts: number; first_detected: string }>();
   return results.map((r) => ({ ts: r.ts, attempts: r.attempts, firstDetected: r.first_detected }));
 }
 
@@ -242,9 +263,9 @@ export async function incrementOrConfirmGapBuckets(db: D1Database, buckets: GapB
         db.prepare(`
           UPDATE gap_buckets
           SET attempts = attempts + 1,
-              confirmed_empty_at = CASE WHEN attempts + 1 >= 3 THEN ? ELSE NULL END
-          WHERE ts = ?
-        `).bind(now, b.ts),
+              confirmed_empty_at = CASE WHEN attempts + 1 >= ? THEN ? ELSE NULL END
+          WHERE ts = ? AND confirmed_empty_at IS NULL
+        `).bind(MAX_GAP_ATTEMPTS, now, b.ts),
       ),
     );
   }

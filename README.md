@@ -221,7 +221,7 @@ Terraform detects changes via `filesha256` on files under `worker/src/` and re-r
 | D1 raw (`tunnel_metrics`) | 7 days | Full 5-min resolution |
 | D1 hourly (`tunnel_metrics_hourly`) | 60 days | Pre-aggregated for 7d/30d ranges |
 | D1 daily (`tunnel_metrics_daily`) | 180 days | Pre-aggregated for 90d/180d ranges |
-| D1 gap tracking (`gap_buckets`) | 7 days | One row per 5-min bucket with no data in any direction; purged with raw retention regardless of status |
+| D1 gap tracking (`gap_buckets`) | 180 days | One row per 5-min bucket with no data in any direction; retried at +0/+1h/+6h/+24h/+72h after discovery, then confirmed empty and kept as a record |
 | R2 raw CSVs | 6 months | Used for billing p95 and CSV export |
 
 Retention is enforced automatically by the daily midnight UTC cron run.

@@ -58,7 +58,7 @@ afterEach(() => {
 });
 
 async function pendingFor(ts: string): Promise<TrackedGapBucket | undefined> {
-  return (await getPendingGapBuckets(DB, 100)).find((p) => p.ts === ts);
+  return (await getPendingGapBuckets(DB, 100, new Date('2030-01-01T00:00:00Z'))).find((p) => p.ts === ts);
 }
 
 describe('retryPendingGaps', () => {

@@ -8,6 +8,8 @@ import {
 import { applyTestSchema } from './helpers/schema';
 
 const DB = (env as { DB: D1Database }).DB;
+// Far enough ahead that every backoff step has elapsed for the fixtures below.
+const FUTURE = new Date('2030-01-01T00:00:00Z');
 
 beforeAll(async () => {
   await applyTestSchema(DB);
@@ -49,7 +51,7 @@ describe('insertGapBuckets + getPendingGapBuckets', () => {
     await incrementOrConfirmGapBuckets(DB, [{ ts: '2026-04-01T00:00:00Z' }], '2026-04-01T00:45:00Z');
     await insertGapBuckets(DB, [{ ts: '2026-04-01T00:00:00Z' }], '2026-04-01T02:00:00Z');
 
-    const pending = (await getPendingGapBuckets(DB, 100)).filter((p) => p.ts.startsWith('2026-04-01'));
+    const pending = (await getPendingGapBuckets(DB, 100, FUTURE)).filter((p) => p.ts.startsWith('2026-04-01'));
     expect(pending.map((p) => p.ts)).toEqual(['2026-04-01T00:00:00Z', '2026-04-01T00:05:00Z']);
     expect(pending[0]).toMatchObject({ attempts: 1, firstDetected: '2026-04-01T00:30:00Z' });
     expect(pending[1]).toMatchObject({ attempts: 0 });
@@ -59,25 +61,59 @@ describe('insertGapBuckets + getPendingGapBuckets', () => {
     await insertGapBuckets(DB, [
       { ts: '2026-04-05T00:00:00Z' }, { ts: '2026-04-05T00:05:00Z' }, { ts: '2026-04-05T00:10:00Z' },
     ], '2026-04-05T01:00:00Z');
-    expect(await getPendingGapBuckets(DB, 2)).toHaveLength(2);
+    expect(await getPendingGapBuckets(DB, 2, FUTURE)).toHaveLength(2);
   });
 });
 
 describe('incrementOrConfirmGapBuckets', () => {
-  it('confirms empty at the third failed retry and drops it from pending', async () => {
+  it('confirms empty at the fifth failed retry and drops it from pending', async () => {
     const b = { ts: '2026-05-01T00:00:00Z' };
     await insertGapBuckets(DB, [b], '2026-05-01T00:00:00Z');
-    const find = async () => (await getPendingGapBuckets(DB, 100)).find((p) => p.ts === b.ts);
+    const find = async () => (await getPendingGapBuckets(DB, 100, FUTURE)).find((p) => p.ts === b.ts);
 
-    await incrementOrConfirmGapBuckets(DB, [b], '2026-05-01T01:00:00Z');
-    expect((await find())?.attempts).toBe(1);
-    await incrementOrConfirmGapBuckets(DB, [b], '2026-05-01T02:00:00Z');
-    expect((await find())?.attempts).toBe(2);
-    await incrementOrConfirmGapBuckets(DB, [b], '2026-05-01T03:00:00Z');
+    for (let n = 1; n <= 4; n++) {
+      await incrementOrConfirmGapBuckets(DB, [b], `2026-05-01T0${n}:00:00Z`);
+      expect((await find())?.attempts).toBe(n);
+    }
+    await incrementOrConfirmGapBuckets(DB, [b], '2026-05-01T05:00:00Z');
     expect(await find()).toBeUndefined();
 
     const rows = await getGapBuckets(DB, '2026-05-01T00:00:00Z', '2026-05-01T00:05:00Z', 'confirmed_empty', 10);
-    expect(rows).toEqual([{ ts: b.ts, attempts: 3, first_detected: '2026-05-01T00:00:00Z', confirmed_empty_at: '2026-05-01T03:00:00Z' }]);
+    expect(rows).toEqual([{ ts: b.ts, attempts: 5, first_detected: '2026-05-01T00:00:00Z', confirmed_empty_at: '2026-05-01T05:00:00Z' }]);
+  });
+});
+
+describe('retry backoff schedule', () => {
+  it('makes attempt n eligible only once first_detected + schedule[n] has passed', async () => {
+    const b = { ts: '2026-08-20T00:00:00Z' };
+    const t0 = '2026-08-20T02:00:00.000Z';
+    await insertGapBuckets(DB, [b], t0);
+    const MIN = 60 * 1000;
+    const HOUR = 60 * MIN;
+    const at = (ms: number) => new Date(new Date(t0).getTime() + ms);
+    const eligible = async (now: Date) => (await getPendingGapBuckets(DB, 100, now)).some((p) => p.ts === b.ts);
+
+    // attempt 0: immediately
+    expect(await eligible(at(0))).toBe(true);
+    await incrementOrConfirmGapBuckets(DB, [b], at(0).toISOString());
+    // attempt 1: +1h
+    expect(await eligible(at(59 * MIN))).toBe(false);
+    expect(await eligible(at(60 * MIN))).toBe(true);
+    await incrementOrConfirmGapBuckets(DB, [b], at(HOUR).toISOString());
+    // attempt 2: +6h
+    expect(await eligible(at(5 * HOUR + 59 * MIN))).toBe(false);
+    expect(await eligible(at(6 * HOUR))).toBe(true);
+    await incrementOrConfirmGapBuckets(DB, [b], at(6 * HOUR).toISOString());
+    // attempt 3: +24h
+    expect(await eligible(at(23 * HOUR))).toBe(false);
+    expect(await eligible(at(24 * HOUR))).toBe(true);
+    await incrementOrConfirmGapBuckets(DB, [b], at(24 * HOUR).toISOString());
+    // attempt 4: +72h
+    expect(await eligible(at(71 * HOUR))).toBe(false);
+    expect(await eligible(at(72 * HOUR))).toBe(true);
+    await incrementOrConfirmGapBuckets(DB, [b], at(72 * HOUR).toISOString());
+    // fifth failure is terminal
+    expect(await eligible(FUTURE)).toBe(false);
   });
 });
 
@@ -86,14 +122,14 @@ describe('deleteResolvedGapBuckets', () => {
     const b = { ts: '2026-06-01T00:00:00Z' };
     await insertGapBuckets(DB, [b], '2026-06-01T00:00:00Z');
     await deleteResolvedGapBuckets(DB, [b]);
-    expect((await getPendingGapBuckets(DB, 100)).find((p) => p.ts === b.ts)).toBeUndefined();
+    expect((await getPendingGapBuckets(DB, 100, FUTURE)).find((p) => p.ts === b.ts)).toBeUndefined();
   });
 });
 
 describe('getGapBuckets / counts', () => {
   it('filters by status, orders by ts, and counts range totals independently of the page', async () => {
     await insertGapBuckets(DB, [{ ts: '2026-07-01T10:05:00Z' }, { ts: '2026-07-01T10:00:00Z' }], '2026-07-01T12:00:00Z');
-    for (const at of ['2026-07-01T13:00:00Z', '2026-07-01T14:00:00Z', '2026-07-01T15:00:00Z']) {
+    for (const at of ['2026-07-01T13:00:00Z', '2026-07-01T14:00:00Z', '2026-07-01T15:00:00Z', '2026-07-01T16:00:00Z', '2026-07-01T17:00:00Z']) {
       await incrementOrConfirmGapBuckets(DB, [{ ts: '2026-07-01T10:05:00Z' }], at);
     }
 
