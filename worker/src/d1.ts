@@ -1,4 +1,4 @@
-import type { NormalizedRow, TunnelStat, GapCell, TrackedGapCell, CronStep } from './types';
+import type { NormalizedRow, TunnelStat, GapCell, TrackedGapCell, GapBucket, TrackedGapBucket, CronStep } from './types';
 
 const BATCH_SIZE = 100;
 
@@ -250,6 +250,142 @@ export async function incrementOrConfirmGaps(db: D1Database, cells: GapCell[], n
       ),
     );
   }
+}
+
+// ── Bucket-level gap tracking (gap_buckets) ─────────────────────────────────
+// A bucket is a gap when no tunnel reported in either direction. Per-tunnel
+// absence is normal (idle tunnels emit no row), so it is not tracked.
+
+// Twelve 5-min slots per hour, each probed with NOT EXISTS rather than a
+// LEFT JOIN — a join would multiply the slot by every matching raw row before
+// the NULL test. Both raw probes lead with direction so idx_tm_direction_ts
+// applies and stops at the first hit: at most 24 index probes per hour,
+// independent of tunnel count.
+export async function findMissingBuckets(
+  db: D1Database,
+  windowStart: string,
+  windowEnd: string,
+): Promise<GapBucket[]> {
+  const { results } = await db.prepare(`
+    WITH RECURSIVE slots(ts) AS (
+      SELECT strftime('%Y-%m-%dT%H:%M:%SZ', ?1)
+      UNION ALL
+      SELECT strftime('%Y-%m-%dT%H:%M:%SZ', ts, '+300 seconds') FROM slots
+      WHERE strftime('%Y-%m-%dT%H:%M:%SZ', ts, '+300 seconds') < ?2
+    )
+    SELECT s.ts FROM slots s
+    WHERE NOT EXISTS (SELECT 1 FROM tunnel_metrics WHERE direction = 'ingress' AND ts = s.ts)
+      AND NOT EXISTS (SELECT 1 FROM tunnel_metrics WHERE direction = 'egress' AND ts = s.ts)
+      AND NOT EXISTS (SELECT 1 FROM gap_buckets WHERE ts = s.ts)
+    ORDER BY s.ts
+  `).bind(windowStart, windowEnd).all<{ ts: string }>();
+  return results.map((r) => ({ ts: r.ts }));
+}
+
+export async function insertGapBuckets(db: D1Database, buckets: GapBucket[], now: string): Promise<void> {
+  if (buckets.length === 0) return;
+  for (let i = 0; i < buckets.length; i += BATCH_SIZE) {
+    const chunk = buckets.slice(i, i + BATCH_SIZE);
+    await db.batch(
+      chunk.map((b) =>
+        db.prepare('INSERT OR IGNORE INTO gap_buckets (ts, attempts, first_detected) VALUES (?, 0, ?)')
+          .bind(b.ts, now),
+      ),
+    );
+  }
+}
+
+// Oldest first_detected first. Rows are buckets, so a plain LIMIT is the
+// bucket budget (unlike the per-cell version, which had to cap by distinct ts).
+export async function getPendingGapBuckets(db: D1Database, limit: number): Promise<TrackedGapBucket[]> {
+  const { results } = await db.prepare(`
+    SELECT ts, attempts, first_detected
+    FROM gap_buckets
+    WHERE confirmed_empty_at IS NULL AND attempts < 3
+    ORDER BY first_detected ASC, ts ASC
+    LIMIT ?
+  `).bind(limit).all<{ ts: string; attempts: number; first_detected: string }>();
+  return results.map((r) => ({ ts: r.ts, attempts: r.attempts, firstDetected: r.first_detected }));
+}
+
+export async function deleteResolvedGapBuckets(db: D1Database, buckets: GapBucket[]): Promise<void> {
+  if (buckets.length === 0) return;
+  for (let i = 0; i < buckets.length; i += BATCH_SIZE) {
+    const chunk = buckets.slice(i, i + BATCH_SIZE);
+    await db.batch(chunk.map((b) => db.prepare('DELETE FROM gap_buckets WHERE ts = ?').bind(b.ts)));
+  }
+}
+
+export async function incrementOrConfirmGapBuckets(db: D1Database, buckets: GapBucket[], now: string): Promise<void> {
+  if (buckets.length === 0) return;
+  for (let i = 0; i < buckets.length; i += BATCH_SIZE) {
+    const chunk = buckets.slice(i, i + BATCH_SIZE);
+    await db.batch(
+      chunk.map((b) =>
+        db.prepare(`
+          UPDATE gap_buckets
+          SET attempts = attempts + 1,
+              confirmed_empty_at = CASE WHEN attempts + 1 >= 3 THEN ? ELSE NULL END
+          WHERE ts = ?
+        `).bind(now, b.ts),
+      ),
+    );
+  }
+}
+
+export interface GapBucketRow {
+  ts: string;
+  attempts: number;
+  first_detected: string;
+  confirmed_empty_at: string | null;
+}
+
+// ts range on the primary key. Bounds are raw ts format.
+export async function getGapBuckets(
+  db: D1Database,
+  start: string,
+  end: string,
+  status: 'pending' | 'confirmed_empty' | null,
+  limit: number,
+): Promise<GapBucketRow[]> {
+  const statusClause = status === 'pending'
+    ? 'AND confirmed_empty_at IS NULL'
+    : status === 'confirmed_empty'
+      ? 'AND confirmed_empty_at IS NOT NULL'
+      : '';
+  const { results } = await db.prepare(`
+    SELECT ts, attempts, first_detected, confirmed_empty_at
+    FROM gap_buckets
+    WHERE ts >= ?1 AND ts < ?2 ${statusClause}
+    ORDER BY ts
+    LIMIT ?3
+  `).bind(start, end, limit).all<GapBucketRow>();
+  return results;
+}
+
+export async function getGapBucketCounts(
+  db: D1Database,
+  confirmedSince: string,
+): Promise<{ pending: number; confirmedEmpty: number }> {
+  const [p, c] = await Promise.all([
+    db.prepare('SELECT COUNT(*) AS n FROM gap_buckets WHERE confirmed_empty_at IS NULL').first<{ n: number }>(),
+    db.prepare('SELECT COUNT(*) AS n FROM gap_buckets WHERE confirmed_empty_at >= ?').bind(confirmedSince).first<{ n: number }>(),
+  ]);
+  return { pending: p?.n ?? 0, confirmedEmpty: c?.n ?? 0 };
+}
+
+// Range totals for /api/gaps — the LIMIT-bounded page is not a valid source
+// for counts once a status filter narrows it.
+export async function getGapBucketRangeCounts(
+  db: D1Database,
+  start: string,
+  end: string,
+): Promise<{ pending: number; confirmedEmpty: number }> {
+  const [p, c] = await Promise.all([
+    db.prepare('SELECT COUNT(*) AS n FROM gap_buckets WHERE ts >= ?1 AND ts < ?2 AND confirmed_empty_at IS NULL').bind(start, end).first<{ n: number }>(),
+    db.prepare('SELECT COUNT(*) AS n FROM gap_buckets WHERE ts >= ?1 AND ts < ?2 AND confirmed_empty_at IS NOT NULL').bind(start, end).first<{ n: number }>(),
+  ]);
+  return { pending: p?.n ?? 0, confirmedEmpty: c?.n ?? 0 };
 }
 
 export interface GapCellRow {
