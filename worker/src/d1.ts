@@ -69,6 +69,41 @@ export async function rollupDay(db: D1Database, dayStart: string): Promise<numbe
   return result.meta.changes ?? 0;
 }
 
+// Retention deletes run sequentially and index-bounded. Every predicate
+// leads with direction so idx_*_direction_ts applies (a bare `ts < ?` is a
+// full scan — ~1M rows at 577 tunnels); each statement covers one chunk of
+// one direction so no single statement can hit D1's timeout. The loop walks
+// from the oldest row up to the cutoff, so a purge that failed yesterday
+// resumes where it left off.
+async function purgeTableInChunks(
+  db: D1Database,
+  table: 'tunnel_metrics' | 'tunnel_metrics_hourly' | 'tunnel_metrics_daily',
+  cutoff: Date,
+  chunkMs: number,
+  fmt: (d: Date) => string,
+): Promise<number> {
+  let deleted = 0;
+  for (const direction of ['ingress', 'egress'] as const) {
+    const oldest = await db.prepare(`SELECT MIN(ts) AS ts FROM ${table} WHERE direction = ?`)
+      .bind(direction).first<{ ts: string | null }>();
+    if (!oldest?.ts) continue;
+    let from = new Date(Math.floor(new Date(oldest.ts).getTime() / chunkMs) * chunkMs);
+    while (from < cutoff) {
+      const to = new Date(Math.min(from.getTime() + chunkMs, cutoff.getTime()));
+      const result = await db.prepare(`DELETE FROM ${table} WHERE direction = ? AND ts >= ? AND ts < ?`)
+        .bind(direction, fmt(from), fmt(to)).run();
+      deleted += result.meta.changes ?? 0;
+      from = to;
+    }
+  }
+  return deleted;
+}
+
+// tunnel_metrics stores raw ts (no ms); the rollup tables store toISOString().
+// An unaligned cutoff keeps its milliseconds — still a valid lexical bound.
+const rawTs = (d: Date): string => d.toISOString().replace('.000Z', 'Z');
+const isoTs = (d: Date): string => d.toISOString();
+
 export async function purgeOldData(db: D1Database): Promise<{
   rawDeleted: number;
   hourlyDeleted: number;
@@ -83,20 +118,21 @@ export async function purgeOldData(db: D1Database): Promise<{
   const dailyCutoff = new Date(now);
   dailyCutoff.setUTCDate(dailyCutoff.getUTCDate() - 180);
 
-  const [rawResult, hourlyResult, dailyResult, gapResult] = await Promise.all([
-    db.prepare('DELETE FROM tunnel_metrics WHERE ts < ?').bind(rawCutoff.toISOString()).run(),
-    db.prepare('DELETE FROM tunnel_metrics_hourly WHERE ts < ?').bind(hourlyCutoff.toISOString()).run(),
-    db.prepare('DELETE FROM tunnel_metrics_daily WHERE ts < ?').bind(dailyCutoff.toISOString()).run(),
-    // A gap cell whose ts predates raw retention can never be repaired (the
-    // raw row it would resolve against is about to be purged too), so status
-    // no longer matters — pending or confirmed_empty, it goes.
-    db.prepare('DELETE FROM gap_tracking WHERE ts < ?').bind(rawCutoff.toISOString()).run(),
-  ]);
+  const HOUR_MS = 60 * 60 * 1000;
+  const DAY_MS = 24 * HOUR_MS;
+
+  const rawDeleted = await purgeTableInChunks(db, 'tunnel_metrics', rawCutoff, HOUR_MS, rawTs);
+  const hourlyDeleted = await purgeTableInChunks(db, 'tunnel_metrics_hourly', hourlyCutoff, DAY_MS, isoTs);
+  const dailyDeleted = await purgeTableInChunks(db, 'tunnel_metrics_daily', dailyCutoff, DAY_MS, isoTs);
+  // A gap bucket whose ts predates raw retention can never be repaired (the
+  // raw rows it would resolve against are gone), so status no longer matters.
+  // At most 2,016 rows; the PK range is enough.
+  const gapResult = await db.prepare('DELETE FROM gap_buckets WHERE ts < ?').bind(rawTs(rawCutoff)).run();
 
   return {
-    rawDeleted: rawResult.meta.changes ?? 0,
-    hourlyDeleted: hourlyResult.meta.changes ?? 0,
-    dailyDeleted: dailyResult.meta.changes ?? 0,
+    rawDeleted,
+    hourlyDeleted,
+    dailyDeleted,
     gapTrackingDeleted: gapResult.meta.changes ?? 0,
   };
 }
