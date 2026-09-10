@@ -9,6 +9,12 @@
   "triggers": {
     "crons": ["*/5 * * * *"]
   },
+  // The midnight run re-reads a month of R2 CSVs for billing p95 (~14M lines
+  // at 2000 tunnels); the default 30 s CPU budget is too tight for that.
+  // 300000 is the Workers Paid maximum.
+  "limits": {
+    "cpu_ms": 300000
+  },
   "d1_databases": [
     {
       "binding": "DB",

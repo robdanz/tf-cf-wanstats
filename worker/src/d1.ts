@@ -38,34 +38,57 @@ export async function storeTunnelMetrics(
   }
 }
 
+// Both rollups read their source as two per-direction halves so
+// idx_tm_direction_ts / idx_tmh_direction_ts apply: a bare `ts >= ? AND ts < ?`
+// scans the whole table (millions of rows at 1000+ tunnels) against D1's 30 s
+// query limit. Exported so tests can EXPLAIN QUERY PLAN them.
+// Binds: ?1 = rollup ts to write, ?2 = range start, ?3 = range end.
+export const ROLLUP_HOUR_SQL = `
+  INSERT OR REPLACE INTO tunnel_metrics_hourly
+    (tunnel_name, direction, ts, avg_bit_rate, max_bit_rate, min_bit_rate, sample_count)
+  SELECT tunnel_name, direction, ?1,
+         AVG(bit_rate), MAX(bit_rate), MIN(bit_rate), COUNT(*)
+  FROM (
+    SELECT tunnel_name, direction, bit_rate FROM tunnel_metrics
+    WHERE direction = 'ingress' AND ts >= ?2 AND ts < ?3
+    UNION ALL
+    SELECT tunnel_name, direction, bit_rate FROM tunnel_metrics
+    WHERE direction = 'egress' AND ts >= ?2 AND ts < ?3
+  )
+  GROUP BY tunnel_name, direction
+`;
+
+export const ROLLUP_DAY_SQL = `
+  INSERT OR REPLACE INTO tunnel_metrics_daily
+    (tunnel_name, direction, ts, avg_bit_rate, max_bit_rate, min_bit_rate, sample_count)
+  SELECT tunnel_name, direction, ?1,
+         SUM(avg_bit_rate * sample_count) / SUM(sample_count),
+         MAX(max_bit_rate),
+         MIN(min_bit_rate),
+         SUM(sample_count)
+  FROM (
+    SELECT tunnel_name, direction, avg_bit_rate, max_bit_rate, min_bit_rate, sample_count FROM tunnel_metrics_hourly
+    WHERE direction = 'ingress' AND ts >= ?2 AND ts < ?3
+    UNION ALL
+    SELECT tunnel_name, direction, avg_bit_rate, max_bit_rate, min_bit_rate, sample_count FROM tunnel_metrics_hourly
+    WHERE direction = 'egress' AND ts >= ?2 AND ts < ?3
+  )
+  GROUP BY tunnel_name, direction
+`;
+
+// hourStart is toISOString() (the hourly row's ts); the raw range bounds use
+// raw ts format (no milliseconds) — see the ts format contract above.
 export async function rollupHour(db: D1Database, hourStart: string): Promise<number> {
-  const hourEnd = new Date(new Date(hourStart).getTime() + 60 * 60 * 1000).toISOString();
-  const result = await db.prepare(`
-    INSERT OR REPLACE INTO tunnel_metrics_hourly
-      (tunnel_name, direction, ts, avg_bit_rate, max_bit_rate, min_bit_rate, sample_count)
-    SELECT tunnel_name, direction, ?,
-           AVG(bit_rate), MAX(bit_rate), MIN(bit_rate), COUNT(*)
-    FROM tunnel_metrics
-    WHERE ts >= ? AND ts < ?
-    GROUP BY tunnel_name, direction
-  `).bind(hourStart, hourStart, hourEnd).run();
+  const start = new Date(hourStart);
+  const end = new Date(start.getTime() + 60 * 60 * 1000);
+  const raw = (d: Date): string => d.toISOString().replace('.000Z', 'Z');
+  const result = await db.prepare(ROLLUP_HOUR_SQL).bind(hourStart, raw(start), raw(end)).run();
   return result.meta.changes ?? 0;
 }
 
 export async function rollupDay(db: D1Database, dayStart: string): Promise<number> {
   const dayEnd = new Date(new Date(dayStart).getTime() + 24 * 60 * 60 * 1000).toISOString();
-  const result = await db.prepare(`
-    INSERT OR REPLACE INTO tunnel_metrics_daily
-      (tunnel_name, direction, ts, avg_bit_rate, max_bit_rate, min_bit_rate, sample_count)
-    SELECT tunnel_name, direction, ?,
-           SUM(avg_bit_rate * sample_count) / SUM(sample_count),
-           MAX(max_bit_rate),
-           MIN(min_bit_rate),
-           SUM(sample_count)
-    FROM tunnel_metrics_hourly
-    WHERE ts >= ? AND ts < ?
-    GROUP BY tunnel_name, direction
-  `).bind(dayStart, dayStart, dayEnd).run();
+  const result = await db.prepare(ROLLUP_DAY_SQL).bind(dayStart, dayStart, dayEnd).run();
   return result.meta.changes ?? 0;
 }
 
