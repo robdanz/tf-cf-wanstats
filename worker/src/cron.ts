@@ -1,6 +1,6 @@
 import type { Env } from './types';
 import { fetchMetricsTimeSliced } from './graphql';
-import { storeTunnelMetrics, purgeOldData, setMetadata, storeBillingP95, recordCronError } from './d1';
+import { storeTunnelMetrics, purgeOldData, setMetadata, storeBillingP95, recordCronError, insertGapBuckets } from './d1';
 import { writeRawToR2, computeAggregateBillingP95, purgeOldR2Data } from './r2';
 import { toPeriod } from './utils';
 import { retryPendingGaps } from './gaps';
@@ -94,6 +94,17 @@ async function collect(env: Env, now: Date, windowStart: Date, fullRun: boolean)
 
   if (sliceCount > 0 && failedSlices.length === sliceCount) {
     throw new Error(`all ${sliceCount} slice(s) failed: ${warnings[warnings.length - 1] ?? 'no detail'}`);
+  }
+
+  // A failed slice is a known gap right now — track it in this run rather
+  // than waiting for the ledger to reach the hour two hours later. Best
+  // effort: the rows we did get must still be stored below.
+  if (failedSlices.length > 0) {
+    try {
+      await insertGapBuckets(env.DB, failedSlices.map((s) => ({ ts: s.replace('.000Z', 'Z') })), now.toISOString());
+    } catch (err) {
+      console.error(`Failed to record ${failedSlices.length} failed slice(s) as gap buckets: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   if (!fullRun) {

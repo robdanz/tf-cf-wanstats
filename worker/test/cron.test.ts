@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { env } from 'cloudflare:workers';
 import { handleCron } from '../src/cron';
-import { getMetadata, setMetadata, storeTunnelMetrics, insertGapCells, getPendingGaps } from '../src/d1';
+import { getMetadata, setMetadata, storeTunnelMetrics, insertGapBuckets, getPendingGapBuckets } from '../src/d1';
 import { applyTestSchema } from './helpers/schema';
 
 const DB = (env as { DB: D1Database }).DB;
@@ -42,6 +42,10 @@ describe('handleCron full run', () => {
 
   it('stores rows, marks the run ok, and leaves no error when everything succeeds', async () => {
     await applyTestSchema(DB);
+    // The previous test's ledger recorded its empty 08:00 hour as gap
+    // buckets; clear them so the retry step doesn't repoll them with this
+    // test's stub and inflate the CRON_OK row count.
+    await DB.exec('DELETE FROM gap_buckets');
     await setMetadata(DB, 'reconciled_through', '2026-08-11T07:00:00Z');
     vi.stubGlobal('fetch', vi.fn().mockImplementation(async (_url: string, init: RequestInit) => {
       const body = JSON.parse(init.body as string) as { variables: { datetimeStart: string } };
@@ -59,10 +63,10 @@ describe('handleCron full run', () => {
 
   it('light run stores rows and does not touch the ledger', async () => {
     await applyTestSchema(DB);
-    // Retry now runs on every cron (F5b); clear gap cells left behind by an
-    // earlier test in this file so they don't get repolled here too, using
-    // this test's own fetch stub, and inflate the CRON_LIGHT row count below.
-    await DB.exec('DELETE FROM gap_tracking');
+    // Retry runs on every cron; clear gap buckets left behind by an earlier
+    // test in this file so they don't get repolled here with this test's own
+    // fetch stub and inflate the CRON_LIGHT row count below.
+    await DB.exec('DELETE FROM gap_buckets');
     await setMetadata(DB, 'reconciled_through', '2026-08-12T07:00:00Z');
     vi.stubGlobal('fetch', vi.fn().mockImplementation(async (_url: string, init: RequestInit) => {
       const body = JSON.parse(init.body as string) as { variables: { datetimeStart: string } };
@@ -76,10 +80,10 @@ describe('handleCron full run', () => {
     expect(await getMetadata(DB, 'reconciled_through')).toBe('2026-08-12T07:00:00Z');
   });
 
-  it('light run also retries pending gap cells', async () => {
+  it('light run also retries pending gap buckets', async () => {
     await applyTestSchema(DB);
     const ts = '2026-08-13T09:00:00Z';
-    await insertGapCells(DB, [{ tunnelName: 'CRON_RETRY_LIGHT', direction: 'ingress', ts }], '2026-08-13T09:06:00Z');
+    await insertGapBuckets(DB, [{ ts }], '2026-08-13T09:06:00Z');
 
     vi.stubGlobal('fetch', vi.fn().mockImplementation(async (_url: string, init: RequestInit) => {
       const body = JSON.parse(init.body as string) as { variables: { datetimeStart: string } };
@@ -88,7 +92,27 @@ describe('handleCron full run', () => {
 
     await handleCron(TEST_ENV, new Date('2026-08-13T10:16:00Z')); // minute 16 -> light run
 
-    const pending = await getPendingGaps(DB, 100);
-    expect(pending.find((p) => p.tunnelName === 'CRON_RETRY_LIGHT')).toBeUndefined();
+    expect((await getPendingGapBuckets(DB, 100)).find((p) => p.ts === ts)).toBeUndefined();
+  });
+
+  it('collect records a failed slice as a pending gap bucket in the same run', async () => {
+    await applyTestSchema(DB);
+    await DB.exec('DELETE FROM gap_buckets');
+    await DB.exec("DELETE FROM cron_metadata WHERE key LIKE 'last_error%'");
+    const failStart = '2026-08-14T10:05:00.000Z';
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(init.body as string) as { variables: { datetimeStart: string } };
+      if (body.variables.datetimeStart === failStart) {
+        return new Response('boom', { status: 500, headers: { 'Retry-After': '0' } });
+      }
+      return graphqlRows([{ name: 'CRON_PARTIAL', ts: body.variables.datetimeStart.replace('.000Z', 'Z'), rate: 7 }]);
+    }));
+
+    await handleCron(TEST_ENV, new Date('2026-08-14T10:26:00Z')); // light run, 20-min window: 10:05..10:20
+
+    const pending = await getPendingGapBuckets(DB, 100);
+    expect(pending.map((p) => p.ts)).toContain('2026-08-14T10:05:00Z');
+    // A partial failure is not a collect error: the rows that did arrive were stored.
+    expect(await getMetadata(DB, 'last_error_step')).toBeNull();
   });
 });
