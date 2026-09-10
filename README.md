@@ -9,13 +9,18 @@ Cloudflare WAN utilization analytics dashboard. A single Cloudflare Worker polls
 ## Architecture
 
 ```
-Cron (0 * * * * — every hour)
+Cron (*/5 * * * *)
+  every 5 min (light): 20-min window → D1; retry pending gap buckets
+  every hour  (full):  65-min window → D1 + R2; hour ledger (gap discovery,
+                       hourly/daily rollups, R2 rebuild from D1)
+  midnight UTC:        billing p95 → D1 retention (chunked) → R2 retention,
+                       each step isolated and reported in /api/health
   └─▶ Cloudflare GraphQL API (magicTransitNetworkAnalyticsAdaptiveGroups)
         time-sliced per 5-min bucket, GRAPHQL_LIMIT=3000, ingress + egress aliases
   └─▶ D1 (INSERT OR REPLACE — tunnel_metrics, raw 5-min rows)
   └─▶ R2 (raw/YYYY-MM-DD/HH.csv — one object per hour)
-  └─▶ D1 hourly rollup (tunnel_metrics_hourly)
-  └─▶ [midnight UTC] D1 daily rollup + retention enforcement (D1 + R2)
+  └─▶ D1 gap_buckets — a 5-min bucket with no rows in any direction (a failed
+        GraphQL slice affects every tunnel; idle tunnels are not gaps)
 
 HTTP (workers.dev)
   GET /                                          → Dashboard HTML (Chart.js, inline)
@@ -27,6 +32,9 @@ HTTP (workers.dev)
   GET /api/billing/tunnels?period=&page=&sort=   → Per-tunnel billing p95, paginated
   GET /api/export?start=&end=&tunnel=            → CSV export of raw data from R2
   POST /api/backfill?start=&end=                 → Upsert one time window (D1+R2, requires X-Backfill-Token)
+  GET /api/gaps?start=&end=&status=              → Pending / confirmed-empty 5-min buckets (tunnel_name and
+                                                   direction are "*"; a legacy tunnel= filter is ignored)
+  GET /api/health                                → Cron status, ledger watermark, gap counts, per-step last errors
 ```
 
 The aggregate p95 mirrors Cloudflare's billing methodology: sum all non-excluded tunnel traffic at each 5-minute interval, then take the p95 of those sums.
@@ -213,7 +221,7 @@ Terraform detects changes via `filesha256` on files under `worker/src/` and re-r
 | D1 raw (`tunnel_metrics`) | 7 days | Full 5-min resolution |
 | D1 hourly (`tunnel_metrics_hourly`) | 60 days | Pre-aggregated for 7d/30d ranges |
 | D1 daily (`tunnel_metrics_daily`) | 180 days | Pre-aggregated for 90d/180d ranges |
-| D1 gap tracking (`gap_tracking`) | 7 days | Only confirmed-empty rows are purged; unresolved rows stay until resolved |
+| D1 gap tracking (`gap_buckets`) | 7 days | One row per 5-min bucket with no data in any direction; purged with raw retention regardless of status |
 | R2 raw CSVs | 6 months | Used for billing p95 and CSV export |
 
 Retention is enforced automatically by the daily midnight UTC cron run.

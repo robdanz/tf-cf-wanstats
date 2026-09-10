@@ -1,4 +1,4 @@
-import type { NormalizedRow, TunnelStat, GapCell, TrackedGapCell, GapBucket, TrackedGapBucket, CronStep } from './types';
+import type { NormalizedRow, TunnelStat, GapBucket, TrackedGapBucket, CronStep } from './types';
 
 const BATCH_SIZE = 100;
 
@@ -165,132 +165,13 @@ export async function getOldestRawTs(db: D1Database): Promise<string | null> {
   return row?.ts ?? null;
 }
 
-// ── Gap tracking (detect + bounded auto-repoll) ─────────────────────────────
-// See docs/superpowers/specs/2026-08-25-gap-detection-repoll-design.md.
-// A gap_tracking row exists only while a cell is unresolved: resolved cells
-// are deleted (the raw row is the record); confirmed_empty_at rows are
-// terminal and excluded from all future discovery.
-
-export async function findMissingGapCells(
-  db: D1Database,
-  windowStart: string,
-  windowEnd: string,
-  rosterSince: string,
-): Promise<GapCell[]> {
-  const { results } = await db.prepare(`
-    WITH RECURSIVE slots(ts) AS (
-      SELECT strftime('%Y-%m-%dT%H:%M:%SZ', ?1)
-      UNION ALL
-      SELECT strftime('%Y-%m-%dT%H:%M:%SZ', ts, '+300 seconds') FROM slots
-      WHERE strftime('%Y-%m-%dT%H:%M:%SZ', ts, '+300 seconds') < ?2
-    ),
-    -- Two sargable halves UNIONed (same pattern as CURRENT_METRICS_SQL): a bare
-    -- ts predicate can't use idx_tm_direction_ts, and filtering to one direction
-    -- would drop tunnels whose only recent data is the other direction.
-    active_tunnels AS (
-      SELECT tunnel_name FROM tunnel_metrics WHERE direction = 'ingress' AND ts >= ?3
-      UNION
-      SELECT tunnel_name FROM tunnel_metrics WHERE direction = 'egress' AND ts >= ?3
-    ),
-    expected AS (
-      SELECT at.tunnel_name, d.direction, s.ts
-      FROM active_tunnels at
-      CROSS JOIN (SELECT 'ingress' AS direction UNION ALL SELECT 'egress') d
-      CROSS JOIN slots s
-    )
-    SELECT e.tunnel_name, e.direction, e.ts
-    FROM expected e
-    LEFT JOIN tunnel_metrics m
-      ON m.tunnel_name = e.tunnel_name AND m.direction = e.direction AND m.ts = e.ts
-    LEFT JOIN gap_tracking g
-      ON g.tunnel_name = e.tunnel_name AND g.direction = e.direction AND g.ts = e.ts
-    WHERE m.ts IS NULL AND g.tunnel_name IS NULL
-  `).bind(windowStart, windowEnd, rosterSince).all<{ tunnel_name: string; direction: string; ts: string }>();
-
-  return results.map((r) => ({
-    tunnelName: r.tunnel_name,
-    direction: r.direction as 'ingress' | 'egress',
-    ts: r.ts,
-  }));
-}
-
-export async function insertGapCells(db: D1Database, cells: GapCell[], now: string): Promise<void> {
-  if (cells.length === 0) return;
-  for (let i = 0; i < cells.length; i += BATCH_SIZE) {
-    const chunk = cells.slice(i, i + BATCH_SIZE);
-    await db.batch(
-      chunk.map((c) =>
-        db.prepare(
-          'INSERT OR IGNORE INTO gap_tracking (tunnel_name, direction, ts, attempts, first_detected) VALUES (?, ?, ?, 0, ?)',
-        ).bind(c.tunnelName, c.direction, c.ts, now),
-      ),
-    );
-  }
-}
-
-// Caps by *distinct timestamp*, not cell count: one missing 5-min bucket can be
-// thousands of cells at scale, and a plain LIMIT would split a single bucket's
-// cells across runs for nothing — one GraphQL call returns every tunnel for a
-// bucket anyway. Oldest-first by the earliest first_detected of each timestamp.
-export async function getPendingGaps(db: D1Database, maxDistinctTimestamps: number): Promise<TrackedGapCell[]> {
-  const { results } = await db.prepare(`
-    WITH candidate_ts AS (
-      SELECT ts, MIN(first_detected) AS earliest
-      FROM gap_tracking
-      WHERE confirmed_empty_at IS NULL AND attempts < 3
-      GROUP BY ts
-      ORDER BY earliest ASC
-      LIMIT ?
-    )
-    SELECT g.tunnel_name, g.direction, g.ts, g.attempts, g.first_detected
-    FROM gap_tracking g
-    JOIN candidate_ts c ON g.ts = c.ts
-    WHERE g.confirmed_empty_at IS NULL AND g.attempts < 3
-    ORDER BY g.first_detected ASC
-  `).bind(maxDistinctTimestamps).all<{ tunnel_name: string; direction: string; ts: string; attempts: number; first_detected: string }>();
-
-  return results.map((r) => ({
-    tunnelName: r.tunnel_name,
-    direction: r.direction as 'ingress' | 'egress',
-    ts: r.ts,
-    attempts: r.attempts,
-    firstDetected: r.first_detected,
-  }));
-}
-
-export async function deleteResolvedGaps(db: D1Database, cells: GapCell[]): Promise<void> {
-  if (cells.length === 0) return;
-  for (let i = 0; i < cells.length; i += BATCH_SIZE) {
-    const chunk = cells.slice(i, i + BATCH_SIZE);
-    await db.batch(
-      chunk.map((c) =>
-        db.prepare('DELETE FROM gap_tracking WHERE tunnel_name = ? AND direction = ? AND ts = ?')
-          .bind(c.tunnelName, c.direction, c.ts),
-      ),
-    );
-  }
-}
-
-export async function incrementOrConfirmGaps(db: D1Database, cells: GapCell[], now: string): Promise<void> {
-  if (cells.length === 0) return;
-  for (let i = 0; i < cells.length; i += BATCH_SIZE) {
-    const chunk = cells.slice(i, i + BATCH_SIZE);
-    await db.batch(
-      chunk.map((c) =>
-        db.prepare(`
-          UPDATE gap_tracking
-          SET attempts = attempts + 1,
-              confirmed_empty_at = CASE WHEN attempts + 1 >= 3 THEN ? ELSE NULL END
-          WHERE tunnel_name = ? AND direction = ? AND ts = ?
-        `).bind(now, c.tunnelName, c.direction, c.ts),
-      ),
-    );
-  }
-}
-
-// ── Bucket-level gap tracking (gap_buckets) ─────────────────────────────────
+// ── Gap tracking (detect + bounded auto-repoll), per 5-min bucket ───────────
+// See docs/superpowers/specs/2026-09-10-bucket-level-gaps-design.md.
 // A bucket is a gap when no tunnel reported in either direction. Per-tunnel
-// absence is normal (idle tunnels emit no row), so it is not tracked.
+// absence is normal (idle tunnels emit no row), so it is not tracked. A row
+// exists only while a bucket is unresolved: resolved buckets are deleted (the
+// raw rows are the record); confirmed_empty_at rows are terminal and excluded
+// from all future discovery.
 
 // Twelve 5-min slots per hour, each probed with NOT EXISTS rather than a
 // LEFT JOIN — a join would multiply the slot by every matching raw row before
@@ -420,77 +301,6 @@ export async function getGapBucketRangeCounts(
   const [p, c] = await Promise.all([
     db.prepare('SELECT COUNT(*) AS n FROM gap_buckets WHERE ts >= ?1 AND ts < ?2 AND confirmed_empty_at IS NULL').bind(start, end).first<{ n: number }>(),
     db.prepare('SELECT COUNT(*) AS n FROM gap_buckets WHERE ts >= ?1 AND ts < ?2 AND confirmed_empty_at IS NOT NULL').bind(start, end).first<{ n: number }>(),
-  ]);
-  return { pending: p?.n ?? 0, confirmedEmpty: c?.n ?? 0 };
-}
-
-export interface GapCellRow {
-  tunnel_name: string;
-  direction: string;
-  ts: string;
-  attempts: number;
-  first_detected: string;
-  confirmed_empty_at: string | null;
-}
-
-// Range predicate on ts uses idx_gap_ts; the optional filters are applied
-// after the index range. Bounds are raw ts format.
-export async function getGapCells(
-  db: D1Database,
-  start: string,
-  end: string,
-  tunnel: string | null,
-  status: 'pending' | 'confirmed_empty' | null,
-  limit: number,
-): Promise<GapCellRow[]> {
-  const statusClause = status === 'pending'
-    ? 'AND confirmed_empty_at IS NULL'
-    : status === 'confirmed_empty'
-      ? 'AND confirmed_empty_at IS NOT NULL'
-      : '';
-  const tunnelClause = tunnel !== null ? 'AND tunnel_name = ?3' : '';
-  const sql = `
-    SELECT tunnel_name, direction, ts, attempts, first_detected, confirmed_empty_at
-    FROM gap_tracking
-    WHERE ts >= ?1 AND ts < ?2 ${tunnelClause} ${statusClause}
-    ORDER BY ts, tunnel_name, direction
-    LIMIT ?4
-  `;
-  const stmt = db.prepare(sql);
-  const bound = tunnel !== null ? stmt.bind(start, end, tunnel, limit) : stmt.bind(start, end, null, limit);
-  const { results } = await bound.all<GapCellRow>();
-  return results;
-}
-
-// Both predicates lead idx_gap_pending (confirmed_empty_at, ...).
-export async function getGapCounts(
-  db: D1Database,
-  confirmedSince: string,
-): Promise<{ pending: number; confirmedEmpty: number }> {
-  const [p, c] = await Promise.all([
-    db.prepare('SELECT COUNT(*) AS n FROM gap_tracking WHERE confirmed_empty_at IS NULL').first<{ n: number }>(),
-    db.prepare('SELECT COUNT(*) AS n FROM gap_tracking WHERE confirmed_empty_at >= ?').bind(confirmedSince).first<{ n: number }>(),
-  ]);
-  return { pending: p?.n ?? 0, confirmedEmpty: c?.n ?? 0 };
-}
-
-// Range totals for /api/gaps — the page (LIMIT-bounded) is not a valid source
-// for pending/confirmed_empty counts, since a truncated or filtered page
-// undercounts. Same optional-tunnel bind trick as getGapCells: bind null for
-// ?3 when tunnel is absent so one prepared statement covers both cases.
-export async function getGapRangeCounts(
-  db: D1Database,
-  start: string,
-  end: string,
-  tunnel: string | null,
-): Promise<{ pending: number; confirmedEmpty: number }> {
-  const tunnelClause = tunnel !== null ? 'AND tunnel_name = ?3' : '';
-  const pendingSql = `SELECT COUNT(*) AS n FROM gap_tracking WHERE ts >= ?1 AND ts < ?2 ${tunnelClause} AND confirmed_empty_at IS NULL`;
-  const confirmedSql = `SELECT COUNT(*) AS n FROM gap_tracking WHERE ts >= ?1 AND ts < ?2 ${tunnelClause} AND confirmed_empty_at IS NOT NULL`;
-  const bindArgs = tunnel !== null ? [start, end, tunnel] : [start, end];
-  const [p, c] = await Promise.all([
-    db.prepare(pendingSql).bind(...bindArgs).first<{ n: number }>(),
-    db.prepare(confirmedSql).bind(...bindArgs).first<{ n: number }>(),
   ]);
   return { pending: p?.n ?? 0, confirmedEmpty: c?.n ?? 0 };
 }

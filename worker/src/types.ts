@@ -42,17 +42,6 @@ export interface GraphQLResponse {
 
 export type NormalizedRow = { tunnelName: string; ts: string; bitRate: number };
 
-export interface GapCell {
-  tunnelName: string;
-  direction: 'ingress' | 'egress';
-  ts: string;
-}
-
-export interface TrackedGapCell extends GapCell {
-  attempts: number;
-  firstDetected: string;
-}
-
 // A 5-min bucket with no raw rows in either direction. Gaps are whole-bucket
 // events (a failed GraphQL slice affects every tunnel), so this is the unit
 // of tracking; per-tunnel absence is normal for idle tunnels.
