@@ -79,4 +79,4 @@ export interface BillingP95Result {
   computed_at: string;
 }
 
-export type CronStep = 'collect' | 'retry' | 'reconcile' | 'daily' | 'billing' | 'purge_d1' | 'purge_r2';
+export type CronStep = 'collect' | 'retry' | 'reconcile' | 'billing' | 'purge_d1' | 'purge_r2';

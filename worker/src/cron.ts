@@ -54,12 +54,7 @@ export async function handleCron(env: Env, now: Date = new Date()): Promise<void
   }
 
   if (now.getUTCHours() === 0) {
-    try {
-      await handleDailyTasks(env, now);
-    } catch (err) {
-      ok = false;
-      await recordCronError(env.DB, 'daily', err);
-    }
+    ok = (await handleDailyTasks(env, now)) && ok;
   }
 
   try {
@@ -128,18 +123,38 @@ async function collect(env: Env, now: Date, windowStart: Date, fullRun: boolean)
   console.log(`R2: wrote ${r2Result.filesWritten} files, ${r2Result.totalRows} total rows`);
 }
 
-// Retention and billing only. Hourly and daily rollups live in the ledger
-// (reconcile.ts) so the midnight run is no longer a single point of failure.
-async function handleDailyTasks(env: Env, now: Date): Promise<void> {
+// Midnight only: billing first, then retention. Each step is isolated and
+// records its own failure — a purge timeout used to take billing down with
+// it, and the hourly reconcile errors then masked that in /api/health.
+// Hourly and daily rollups live in the ledger (reconcile.ts).
+async function handleDailyTasks(env: Env, now: Date): Promise<boolean> {
   console.log('Running daily tasks...');
+  let ok = true;
 
-  const purgeResult = await purgeOldData(env.DB);
-  console.log(`D1 retention: deleted raw=${purgeResult.rawDeleted} hourly=${purgeResult.hourlyDeleted} daily=${purgeResult.dailyDeleted} gaps=${purgeResult.gapTrackingDeleted}`);
+  try {
+    await computeAndStoreBillingP95(env, now);
+  } catch (err) {
+    ok = false;
+    await recordCronError(env.DB, 'billing', err);
+  }
 
-  const r2Deleted = await purgeOldR2Data(env.RAW_METRICS);
-  console.log(`R2 retention: deleted ${r2Deleted} files`);
+  try {
+    const purgeResult = await purgeOldData(env.DB);
+    console.log(`D1 retention: deleted raw=${purgeResult.rawDeleted} hourly=${purgeResult.hourlyDeleted} daily=${purgeResult.dailyDeleted} gaps=${purgeResult.gapTrackingDeleted}`);
+  } catch (err) {
+    ok = false;
+    await recordCronError(env.DB, 'purge_d1', err);
+  }
 
-  await computeAndStoreBillingP95(env, now);
+  try {
+    const r2Deleted = await purgeOldR2Data(env.RAW_METRICS);
+    console.log(`R2 retention: deleted ${r2Deleted} files`);
+  } catch (err) {
+    ok = false;
+    await recordCronError(env.DB, 'purge_r2', err);
+  }
+
+  return ok;
 }
 
 async function computeAndStoreBillingP95(env: Env, now: Date): Promise<void> {

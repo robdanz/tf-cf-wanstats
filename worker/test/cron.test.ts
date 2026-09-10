@@ -115,4 +115,28 @@ describe('handleCron full run', () => {
     // A partial failure is not a collect error: the rows that did arrive were stored.
     expect(await getMetadata(DB, 'last_error_step')).toBeNull();
   });
+
+  it('midnight run computes billing before the D1 purge and records each daily step failure separately', async () => {
+    await applyTestSchema(DB);
+    await DB.exec('DELETE FROM gap_buckets');
+    await DB.exec('DELETE FROM billing_p95');
+    await DB.exec("DELETE FROM cron_metadata WHERE key LIKE 'last_error%'");
+    await setMetadata(DB, 'reconciled_through', '2026-08-15T21:00:00Z');
+    // One raw CSV in R2 for the previous month so billing has something to compute.
+    await BUCKET.put('raw/2026-07-15/10.csv', 'tunnel_name,direction,ts,bit_rate\nBILL_T,ingress,2026-07-15T10:00:00Z,1000\nBILL_T,egress,2026-07-15T10:00:00Z,500\n');
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(graphqlRows([])));
+    // Make the D1 purge fail by hiding the hourly table it walks.
+    await DB.exec('ALTER TABLE tunnel_metrics_hourly RENAME TO tunnel_metrics_hourly_bak');
+    try {
+      await handleCron(TEST_ENV, new Date('2026-08-16T00:01:00Z')); // midnight full run
+    } finally {
+      await DB.exec('ALTER TABLE tunnel_metrics_hourly_bak RENAME TO tunnel_metrics_hourly');
+    }
+
+    const billing = await DB.prepare("SELECT direction, p95_bps FROM billing_p95 WHERE period = '2026-07' AND tunnel_name = '*' ORDER BY direction").all<{ direction: string; p95_bps: number }>();
+    expect(billing.results).toEqual([{ direction: 'egress', p95_bps: 500 }, { direction: 'ingress', p95_bps: 1000 }]);
+    expect(await getMetadata(DB, 'last_error_purge_d1_message')).toMatch(/tunnel_metrics_hourly/);
+    expect(await getMetadata(DB, 'last_error_billing_at')).toBeNull();
+    expect(await getMetadata(DB, 'last_full_run_ok')).toBe('false');
+  });
 });
