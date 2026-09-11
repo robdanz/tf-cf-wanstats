@@ -38,6 +38,22 @@ export function rangeToTable(range: string, customDays?: number): 'raw' | 'hourl
   return 'raw';
 }
 
+// Retention-aware table choice for a custom range: the finest table whose
+// retention still covers the range's start, capped by span so a 60-day
+// hourly query stays bounded. A calendar month (31 days) is hourly, not
+// daily — daily averages flatten p95 badly. Retention: raw 7d, hourly 60d.
+const RAW_RETENTION_DAYS = 7;
+const HOURLY_RETENTION_DAYS = 60;
+
+export function customRangeTable(start: string, end: string, now: Date = new Date()): 'raw' | 'hourly' | 'daily' {
+  const startMs = new Date(start).getTime();
+  const spanDays = Math.ceil((new Date(end).getTime() - startMs) / 86400000);
+  const ageDays = (now.getTime() - startMs) / 86400000;
+  if (spanDays <= 1 && ageDays <= RAW_RETENTION_DAYS) return 'raw';
+  if (spanDays <= HOURLY_RETENTION_DAYS && ageDays <= HOURLY_RETENTION_DAYS) return 'hourly';
+  return 'daily';
+}
+
 export function rangeToUntil(range: string, _customStart?: string, customEnd?: string): string {
   if (range === 'custom' && customEnd) return customEnd;
   return new Date().toISOString();

@@ -1,5 +1,5 @@
 import type { Env, TunnelStat, CronStep } from './types';
-import { verifyToken, rangeToSince, rangeToUntil, rangeToTable, tableToStepSeconds, snapToStep } from './utils';
+import { verifyToken, rangeToSince, rangeToUntil, rangeToTable, customRangeTable, tableToStepSeconds, snapToStep } from './utils';
 import {
   buildPaginatedTunnelsSql,
   buildTunnelCountSql,
@@ -52,9 +52,9 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
     const range = url.searchParams.get('range') ?? '24h';
     const customStart = url.searchParams.get('start') ?? undefined;
     const customEnd = url.searchParams.get('end') ?? undefined;
-    const table = rangeToTable(range, customStart && customEnd
-      ? Math.ceil((new Date(customEnd).getTime() - new Date(customStart).getTime()) / 86400000)
-      : undefined);
+    const table = range === 'custom' && customStart && customEnd
+      ? customRangeTable(customStart, customEnd)
+      : rangeToTable(range);
     const stepSeconds = tableToStepSeconds(table);
     const since = snapToStep(rangeToSince(range, customStart, customEnd), stepSeconds);
     const until = rangeToUntil(range, customStart, customEnd);
@@ -109,9 +109,9 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
     const range = url.searchParams.get('range') ?? '24h';
     const customStart = url.searchParams.get('start') ?? undefined;
     const customEnd = url.searchParams.get('end') ?? undefined;
-    const table = rangeToTable(range, customStart && customEnd
-      ? Math.ceil((new Date(customEnd).getTime() - new Date(customStart).getTime()) / 86400000)
-      : undefined);
+    const table = range === 'custom' && customStart && customEnd
+      ? customRangeTable(customStart, customEnd)
+      : rangeToTable(range);
     const stepSeconds = tableToStepSeconds(table);
     const since = snapToStep(rangeToSince(range, customStart, customEnd), stepSeconds);
     const until = rangeToUntil(range, customStart, customEnd);
@@ -145,9 +145,9 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
     const range = url.searchParams.get('range') ?? '24h';
     const customStart = url.searchParams.get('start') ?? undefined;
     const customEnd = url.searchParams.get('end') ?? undefined;
-    const table = rangeToTable(range, customStart && customEnd
-      ? Math.ceil((new Date(customEnd).getTime() - new Date(customStart).getTime()) / 86400000)
-      : undefined);
+    const table = range === 'custom' && customStart && customEnd
+      ? customRangeTable(customStart, customEnd)
+      : rangeToTable(range);
     const stepSeconds = tableToStepSeconds(table);
     const since = snapToStep(rangeToSince(range, customStart, customEnd), stepSeconds);
     const until = rangeToUntil(range, customStart, customEnd);
