@@ -27,3 +27,6 @@ docs/
 
 # Subagent-driven-development scratch (ledger, briefs, review packages)
 .superpowers/
+
+# Consumer gap reports (customer tunnel names; repo is public)
+scripts/gap-reports/
