@@ -147,19 +147,10 @@ resource "null_resource" "deploy" {
   depends_on = [null_resource.migrate, null_resource.migrate_0002, null_resource.migrate_0003, null_resource.migrate_0004, null_resource.migrate_0005]
 
   triggers = {
-    # Hash all source files so any change triggers redeploy
+    # Hash every file under worker/src so any change — including a new file —
+    # triggers a redeploy. An explicit file list here once missed repoll.ts.
     worker_hash = sha256(join(",", [
-      filesha256("${path.module}/../worker/src/index.ts"),
-      filesha256("${path.module}/../worker/src/types.ts"),
-      filesha256("${path.module}/../worker/src/graphql.ts"),
-      filesha256("${path.module}/../worker/src/d1.ts"),
-      filesha256("${path.module}/../worker/src/r2.ts"),
-      filesha256("${path.module}/../worker/src/cron.ts"),
-      filesha256("${path.module}/../worker/src/gaps.ts"),
-      filesha256("${path.module}/../worker/src/reconcile.ts"),
-      filesha256("${path.module}/../worker/src/api.ts"),
-      filesha256("${path.module}/../worker/src/dashboard.ts"),
-      filesha256("${path.module}/../worker/src/utils.ts"),
+      for f in sort(fileset("${path.module}/../worker/src", "**")) : filesha256("${path.module}/../worker/src/${f}")
     ]))
     wrangler_hash = sha256(local_file.wrangler_jsonc.content)
   }
