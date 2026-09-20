@@ -30,3 +30,4 @@ docs/
 
 # Consumer gap reports (customer tunnel names; repo is public)
 scripts/gap-reports/
+scripts/.reconcile-history.state

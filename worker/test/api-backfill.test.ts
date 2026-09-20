@@ -46,6 +46,43 @@ describe('POST /api/backfill success', () => {
   });
 });
 
+describe('POST /api/backfill archive mode (older than raw retention)', () => {
+  it('writes R2 and rollups from the fetched rows but no raw D1 rows', async () => {
+    await applyTestSchema(DB);
+    const day = new Date(Date.now() - 20 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(init.body as string) as { variables: { datetimeStart: string } };
+      const ts = body.variables.datetimeStart.replace('.000Z', 'Z');
+      const rate = ts.endsWith(':00:00Z') ? 10 : 30; // two buckets: 10 then 30 -> avg 20
+      return Response.json({ data: { viewer: { accounts: [{
+        ingress: [{ avg: { bitRateFiveMinutes: rate }, dimensions: { datetimeFiveMinutes: ts, ingressTunnelName: 'BF_OLD' } }],
+        egress: [],
+      }] } } });
+    }));
+
+    const res = await handleApiRequest(new Request(`https://x.test/api/backfill?start=${day}T05:00:00Z&end=${day}T05:10:00Z`, {
+      method: 'POST', headers: { 'X-Backfill-Token': 'x' },
+    }), TEST_ENV);
+    expect(res.status).toBe(200);
+    const body = await res.json() as { mode: string; ingress_rows: number; rolled_up_hours: string[]; rolled_up_days: string[] };
+    expect(body.mode).toBe('archive');
+    expect(body.ingress_rows).toBe(2);
+    expect(body.rolled_up_hours).toEqual([`${day}T05:00:00.000Z`]);
+    expect(body.rolled_up_days).toEqual([`${day}T00:00:00.000Z`]);
+
+    const raw = await DB.prepare("SELECT COUNT(*) AS n FROM tunnel_metrics WHERE tunnel_name = 'BF_OLD'").first<{ n: number }>();
+    expect(raw?.n).toBe(0);
+    const obj = await BUCKET.get(`raw/${day}/05.csv`);
+    expect((await obj!.text())).toContain(`BF_OLD,ingress,${day}T05:05:00Z,30`);
+    const hourly = await DB.prepare('SELECT avg_bit_rate, max_bit_rate, min_bit_rate, sample_count FROM tunnel_metrics_hourly WHERE tunnel_name = ? AND direction = ? AND ts = ?')
+      .bind('BF_OLD', 'ingress', `${day}T05:00:00.000Z`).first();
+    expect(hourly).toEqual({ avg_bit_rate: 20, max_bit_rate: 30, min_bit_rate: 10, sample_count: 2 });
+    const daily = await DB.prepare('SELECT avg_bit_rate, sample_count FROM tunnel_metrics_daily WHERE tunnel_name = ? AND direction = ? AND ts = ?')
+      .bind('BF_OLD', 'ingress', `${day}T00:00:00.000Z`).first();
+    expect(daily).toEqual({ avg_bit_rate: 20, sample_count: 2 });
+  });
+});
+
 describe('POST /api/backfill total failure', () => {
   it('returns 429 with failed_slices when every slice is rate limited', async () => {
     await applyTestSchema(DB);

@@ -250,65 +250,6 @@ fi
 [[ "$D1_OK" == true ]] || { echo null >"$WORK/d1.json"; echo null >"$WORK/gaps_d1.json"; }
 echo
 
-# ── shared jq prelude: index both sources by "dir|ts" → {tunnel: {...}} ─────
-JQ_PRELUDE='
-  def epoch: (sub("\\.[0-9]+Z$"; "Z") | sub("Z$"; "") | strptime("%Y-%m-%dT%H:%M:%S") | mktime);
-  def iso: strftime("%Y-%m-%dT%H:%M:%SZ");
-  def pad($n): tostring | (" " * $n + .)[-$n:];
-  ($gql | map(
-      (.ts) as $ts
-      | {key: ("ingress|" + $ts), value: (.ingress | map({key: .t, value: .v}) | from_entries)},
-        {key: ("egress|" + $ts),  value: (.egress  | map({key: .t, value: .v}) | from_entries)}
-    ) | from_entries) as $G
-  | (if $d1 == null then null else
-      ($d1 | group_by(.direction + "|" + .ts)
-           | map({key: (.[0].direction + "|" + .[0].ts), value: (map({key: .tunnel_name, value: {v: .bit_rate, w: .written_at}}) | from_entries)})
-           | from_entries) end) as $D
-  | (if $gaps == null then {} else ($gaps | map({key: .ts, value: (if .confirmed_empty_at then "confirmed_empty" else "pending(\(.attempts))" end)}) | from_entries) end) as $GAPS
-  | def changed($a; $b): (($a - $b) | fabs) > ([1, ($a | fabs) * 0.005] | max);
-'
-
-# ── population + revision table ─────────────────────────────────────────────
-if [[ "$GQL" != "0" && ( "$VERBOSE" == "1" || "$MODE" == "range" ) ]]; then
-echo "== Per bucket: rows in D1 vs GraphQL now.  +N rows at source only, -N in D1 only, ~N value changed (>0.5%)"
-jq -r --slurpfile gqlf "$WORK/gql.json" --slurpfile d1f "$WORK/d1.json" --slurpfile gapsf "$WORK/gaps_d1.json" \
-  --rawfile buckets "$WORK/buckets.txt" -n '
-  ($gqlf[0]) as $gql | ($d1f[0]) as $d1 | ($gapsf[0]) as $gaps
-  | '"$JQ_PRELUDE"'
-  ($buckets | split("\n") | map(select(length > 0))) as $B
-  | ([$gql[] | .errors[]] | unique) as $errs
-  | ([$gql[] | select(.limit_hit) | .ts]) as $lim
-  | (if ($errs | length) > 0 then "  GraphQL errors (\([$gql[] | select(.errors | length > 0)] | length) slice(s)): \($errs | join("; "))" else empty end),
-    (if ($lim | length) > 0 then "  WARNING: 3000-row limit hit in \($lim | length) slice(s) — truncated like the collector" else empty end),
-    (if $D == null then "  (D1 unavailable: only GraphQL counts shown)" else empty end),
-    "  bucket                 | ingress: D1  GQL   +add  -rem  ~chg | egress:  D1  GQL   +add  -rem  ~chg | gap_buckets",
-    ( $B[] | . as $ts
-      | [ "ingress", "egress" ] | map(
-          . as $dir | ($G[$dir + "|" + $ts] // {}) as $g | (if $D == null then null else ($D[$dir + "|" + $ts] // {}) end) as $d
-          | if $d == null then "  -   \($g | length | pad(4))      -     -     -"
-            else ($g | keys) as $gk | ($d | keys) as $dk
-              | ($gk | map(select($d[.] == null)) | length) as $add | ($dk | map(select($g[.] == null)) | length) as $rem
-              | ([ $gk[] | select($d[.] != null) | select(changed($g[.]; $d[.].v)) ] | length) as $chg
-              | "\($d | length | pad(4)) \($g | length | pad(4))   \($add | pad(4))  \($rem | pad(4))  \($chg | pad(4))"
-            end)
-      | "  \($ts)  | \(.[0]) | \(.[1]) | \($GAPS[$ts] // "")" ),
-    (if $D != null then
-      ( [ $B[] as $ts | ["ingress","egress"][] as $dir
-          | ($G[$dir + "|" + $ts] // {}) as $g | ($D[$dir + "|" + $ts] // {}) as $d
-          | ($g | keys) as $gk | ($d | keys) as $dk
-          | { d1: ($dk | length), gql: ($gk | length), add: ($gk | map(select($d[.] == null)) | length), rem: ($dk | map(select($g[.] == null)) | length),
-              chg: ([ $gk[] | select($d[.] != null) | select(changed($g[.]; $d[.].v)) ] | length),
-              gbits: ([ $g[] ] | add // 0), dbits: ([ $d[] | .v ] | add // 0) } ]
-        | { d1: (map(.d1) | add), gql: (map(.gql) | add), add: (map(.add) | add), rem: (map(.rem) | add), chg: (map(.chg) | add),
-            gbits: (map(.gbits) | add), dbits: (map(.dbits) | add) }
-        | "  totals: D1 rows \(.d1), source rows now \(.gql): +\(.add) only at source, -\(.rem) only in D1, ~\(.chg) values changed"
-          + (if .dbits > 0 then "; sum of bit rates now vs stored: \(((.gbits / .dbits - 1) * 10000 | round) / 100)%" else "" end) )
-     else empty end)
-' >"$WORK/pop.txt" 2>"$WORK/pop.err" || { echo "  population table failed:"; cat "$WORK/pop.err"; }
-cat "$WORK/pop.txt"
-echo
-fi
-
 # ── R2 via /api/export: one export for the whole probed range, all tunnels ──
 # Compared per hour (one R2 object per hour) against D1. Light runs write D1
 # only; the minute-0 full run writes R2 for the previous 65 min, and the
@@ -349,6 +290,71 @@ if [[ "$R2_OK" == true ]]; then
             | select(length >= 4) | {t: .[0], dir: .[1], ts: .[2], v: (.[3] | tonumber)} | select(.ts >= $s and .ts < $e)]' "$WORK/export.csv" >"$WORK/r2.json"
   echo "  R2 rows in range: $(jq length "$WORK/r2.json")"
 fi
+
+# ── shared jq prelude: index both sources by "dir|ts" → {tunnel: {...}} ─────
+JQ_PRELUDE='
+  def epoch: (sub("\\.[0-9]+Z$"; "Z") | sub("Z$"; "") | strptime("%Y-%m-%dT%H:%M:%S") | mktime);
+  def iso: strftime("%Y-%m-%dT%H:%M:%SZ");
+  def pad($n): tostring | (" " * $n + .)[-$n:];
+  ($gql | map(
+      (.ts) as $ts
+      | {key: ("ingress|" + $ts), value: (.ingress | map({key: .t, value: .v}) | from_entries)},
+        {key: ("egress|" + $ts),  value: (.egress  | map({key: .t, value: .v}) | from_entries)}
+    ) | from_entries) as $G
+  | (if $d1 == null then null else
+      ($d1 | group_by(.direction + "|" + .ts)
+           | map({key: (.[0].direction + "|" + .[0].ts), value: (map({key: .tunnel_name, value: {v: .bit_rate, w: .written_at}}) | from_entries)})
+           | from_entries) end) as $D
+  | (if $gaps == null then {} else ($gaps | map({key: .ts, value: (if .confirmed_empty_at then "confirmed_empty" else "pending(\(.attempts))" end)}) | from_entries) end) as $GAPS
+  | def changed($a; $b): (($a - $b) | fabs) > ([1, ($a | fabs) * 0.005] | max);
+'
+
+# ── population + revision table ─────────────────────────────────────────────
+if [[ "$GQL" != "0" && ( "$VERBOSE" == "1" || "$MODE" == "range" ) ]]; then
+STORE_LABEL=D1
+if [[ "$(jq 'if . == null then 0 else length end' "$WORK/d1.json")" == "0" && "$(jq 'if . == null then 0 else length end' "$WORK/r2.json" 2>/dev/null || echo 0)" != "0" ]]; then STORE_LABEL=R2; fi
+echo "== Per bucket: rows in $STORE_LABEL vs GraphQL now.  +N rows at source only, -N in $STORE_LABEL only, ~N value changed (>0.5%)"
+jq -r --slurpfile gqlf "$WORK/gql.json" --slurpfile d1f "$WORK/d1.json" --slurpfile gapsf "$WORK/gaps_d1.json" --slurpfile r2f "$WORK/r2.json" \
+  --rawfile buckets "$WORK/buckets.txt" --arg lbl "$STORE_LABEL" -n '
+  ($gqlf[0]) as $gql | ($gapsf[0]) as $gaps
+  | (if ($d1f[0] | if . == null then 0 else length end) == 0 and ($r2f[0] | if . == null then 0 else length end) > 0
+     then ($r2f[0] | map({tunnel_name: .t, direction: .dir, ts: .ts, bit_rate: .v, written_at: null}))
+     else $d1f[0] end) as $d1
+  | '"$JQ_PRELUDE"'
+  ($buckets | split("\n") | map(select(length > 0))) as $B
+  | ([$gql[] | .errors[]] | unique) as $errs
+  | ([$gql[] | select(.limit_hit) | .ts]) as $lim
+  | (if ($errs | length) > 0 then "  GraphQL errors (\([$gql[] | select(.errors | length > 0)] | length) slice(s)): \($errs | join("; "))" else empty end),
+    (if ($lim | length) > 0 then "  WARNING: 3000-row limit hit in \($lim | length) slice(s) — truncated like the collector" else empty end),
+    (if $D == null then "  (no store rows for this range: only GraphQL counts shown)" else empty end),
+    "  bucket                 | ingress: \($lbl | .[0:2])  GQL   +add  -rem  ~chg | egress:  \($lbl | .[0:2])  GQL   +add  -rem  ~chg | gap_buckets",
+    ( $B[] | . as $ts
+      | [ "ingress", "egress" ] | map(
+          . as $dir | ($G[$dir + "|" + $ts] // {}) as $g | (if $D == null then null else ($D[$dir + "|" + $ts] // {}) end) as $d
+          | if $d == null then "  -   \($g | length | pad(4))      -     -     -"
+            else ($g | keys) as $gk | ($d | keys) as $dk
+              | ($gk | map(select($d[.] == null)) | length) as $add | ($dk | map(select($g[.] == null)) | length) as $rem
+              | ([ $gk[] | select($d[.] != null) | select(changed($g[.]; $d[.].v)) ] | length) as $chg
+              | "\($d | length | pad(4)) \($g | length | pad(4))   \($add | pad(4))  \($rem | pad(4))  \($chg | pad(4))"
+            end)
+      | "  \($ts)  | \(.[0]) | \(.[1]) | \($GAPS[$ts] // "")" ),
+    (if $D != null then
+      ( [ $B[] as $ts | ["ingress","egress"][] as $dir
+          | ($G[$dir + "|" + $ts] // {}) as $g | ($D[$dir + "|" + $ts] // {}) as $d
+          | ($g | keys) as $gk | ($d | keys) as $dk
+          | { d1: ($dk | length), gql: ($gk | length), add: ($gk | map(select($d[.] == null)) | length), rem: ($dk | map(select($g[.] == null)) | length),
+              chg: ([ $gk[] | select($d[.] != null) | select(changed($g[.]; $d[.].v)) ] | length),
+              gbits: ([ $g[] ] | add // 0), dbits: ([ $d[] | .v ] | add // 0) } ]
+        | { d1: (map(.d1) | add), gql: (map(.gql) | add), add: (map(.add) | add), rem: (map(.rem) | add), chg: (map(.chg) | add),
+            gbits: (map(.gbits) | add), dbits: (map(.dbits) | add) }
+        | "  totals: \($lbl) rows \(.d1), source rows now \(.gql): +\(.add) only at source, -\(.rem) only in \($lbl), ~\(.chg) values changed"
+          + (if .dbits > 0 then "; sum of bit rates now vs stored: \(((.gbits / .dbits - 1) * 10000 | round) / 100)%" else "" end) )
+     else empty end)
+' >"$WORK/pop.txt" 2>"$WORK/pop.err" || { echo "  population table failed:"; cat "$WORK/pop.err"; }
+cat "$WORK/pop.txt"
+echo
+fi
+
 if true; then
   echo
   echo "== R2 archive vs D1 per hour (rows in either store; -N in D1 but not R2, +N in R2 but not D1, ~N value differs >0.5%)"

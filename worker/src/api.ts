@@ -10,6 +10,7 @@ import {
   getBillingP95Tunnels,
   storeTunnelMetrics,
   rollupHour,
+  rollupHourFromRows,
   rollupDay,
   getGapBuckets,
   getGapBucketCounts,
@@ -520,8 +521,19 @@ async function handleBackfill(request: Request, env: Env): Promise<Response> {
     }, { status });
   }
 
+  // Two modes by age. Within raw retention (7 days) the window is stored
+  // like a cron collect: D1 raw rows (conditional upsert, so only changed
+  // rows get a new written_at), R2, then the SQL rollups over D1. Older than
+  // that, D1 raw rows are skipped — the next midnight purge would delete
+  // them and the 7d views never read that far back — and the hourly rollup
+  // is computed from the fetched rows instead, so R2 and the hourly/daily
+  // aggregates still follow the source (Cloudflare serves 16 weeks).
+  const now = new Date();
+  const rawCutoff = now.getTime() - 7 * 24 * 60 * 60 * 1000;
+  const archiveOnly = new Date(end).getTime() <= rawCutoff;
+
   await Promise.all([
-    Promise.all([
+    archiveOnly ? Promise.resolve() : Promise.all([
       storeTunnelMetrics(env.DB, ingress, 'ingress'),
       storeTunnelMetrics(env.DB, egress, 'egress'),
     ]),
@@ -534,11 +546,18 @@ async function handleBackfill(request: Request, env: Env): Promise<Response> {
   // the daily table is only ever written as a whole-day aggregate.
   const rolledHours: string[] = [];
   const rolledDays: string[] = [];
-  const todayStart = snapToDay(new Date()).getTime();
+  const todayStart = snapToDay(now).getTime();
   const days = new Set<string>();
   for (let h = snapToHour(new Date(start)).getTime(); h < new Date(end).getTime(); h += 60 * 60 * 1000) {
     const hour = new Date(h).toISOString();
-    await rollupHour(env.DB, hour);
+    if (h + 60 * 60 * 1000 <= rawCutoff) {
+      const hourRaw = new Date(h).toISOString().replace('.000Z', 'Z');
+      const hourEnd = new Date(h + 60 * 60 * 1000).toISOString().replace('.000Z', 'Z');
+      const inHour = (r: { ts: string }) => r.ts >= hourRaw && r.ts < hourEnd;
+      await rollupHourFromRows(env.DB, hour, ingress.filter(inHour), egress.filter(inHour));
+    } else {
+      await rollupHour(env.DB, hour);
+    }
     rolledHours.push(hour);
     days.add(snapToDay(new Date(h)).toISOString());
   }
@@ -556,6 +575,7 @@ async function handleBackfill(request: Request, env: Env): Promise<Response> {
     egress_rows: egress.length,
     failed_slices: failedSlices,
     warnings,
+    mode: archiveOnly ? 'archive' : 'raw',
     rolled_up_hours: rolledHours,
     rolled_up_days: rolledDays,
   });

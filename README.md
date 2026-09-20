@@ -33,7 +33,9 @@ HTTP (workers.dev)
   GET /api/billing                               → Billing-grade p95 (current + previous month, from R2)
   GET /api/billing/tunnels?period=&page=&sort=   → Per-tunnel billing p95, paginated
   GET /api/export?start=&end=&tunnel=            → CSV export of raw data from R2
-  POST /api/backfill?start=&end=                 → Upsert one time window (D1+R2, requires X-Backfill-Token)
+  POST /api/backfill?start=&end=                 → Re-fetch one window: D1+R2+rollups within 7 days, R2+rollups
+                                                   beyond (requires X-Backfill-Token); scripts/reconcile-history.sh
+                                                   walks the 16 weeks Cloudflare serves, one day at a time, resumably
   GET /api/gaps?start=&end=&status=              → Pending / confirmed-empty 5-min buckets (tunnel_name and
                                                    direction are "*"; a legacy tunnel= filter is ignored)
   GET /api/health                                → Cron status, ledger + re-poll watermarks, gap counts, per-step last errors

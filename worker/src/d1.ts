@@ -86,6 +86,45 @@ export async function rollupHour(db: D1Database, hourStart: string): Promise<num
   return result.meta.changes ?? 0;
 }
 
+// Hourly rollup computed from rows in memory rather than from tunnel_metrics.
+// Used when a window is re-fetched for an hour whose raw rows have aged out
+// of D1 (7-day retention): the raw rows are not stored (the purge would
+// delete them), but the hourly and daily aggregates the 7d/30d/90d views
+// read must still follow the source. Same columns and semantics as
+// ROLLUP_HOUR_SQL.
+export async function rollupHourFromRows(
+  db: D1Database,
+  hourStart: string,
+  ingress: NormalizedRow[],
+  egress: NormalizedRow[],
+): Promise<number> {
+  type Agg = { sum: number; max: number; min: number; n: number };
+  const aggs = new Map<string, Agg>();
+  const add = (rows: NormalizedRow[], direction: 'ingress' | 'egress') => {
+    for (const r of rows) {
+      const key = `${r.tunnelName}\u0000${direction}`;
+      const a = aggs.get(key);
+      if (a === undefined) aggs.set(key, { sum: r.bitRate, max: r.bitRate, min: r.bitRate, n: 1 });
+      else { a.sum += r.bitRate; a.max = Math.max(a.max, r.bitRate); a.min = Math.min(a.min, r.bitRate); a.n++; }
+    }
+  };
+  add(ingress, 'ingress');
+  add(egress, 'egress');
+
+  const entries = Array.from(aggs.entries());
+  for (let i = 0; i < entries.length; i += BATCH_SIZE) {
+    await db.batch(entries.slice(i, i + BATCH_SIZE).map(([key, a]) => {
+      const [tunnelName, direction] = key.split('\u0000');
+      return db.prepare(`
+        INSERT OR REPLACE INTO tunnel_metrics_hourly
+          (tunnel_name, direction, ts, avg_bit_rate, max_bit_rate, min_bit_rate, sample_count)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).bind(tunnelName, direction, hourStart, a.sum / a.n, a.max, a.min, a.n);
+    }));
+  }
+  return entries.length;
+}
+
 export async function rollupDay(db: D1Database, dayStart: string): Promise<number> {
   const dayEnd = new Date(new Date(dayStart).getTime() + 24 * 60 * 60 * 1000).toISOString();
   const result = await db.prepare(ROLLUP_DAY_SQL).bind(dayStart, dayStart, dayEnd).run();
