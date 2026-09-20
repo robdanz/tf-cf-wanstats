@@ -20,6 +20,7 @@ import {
 import { fetchMetricsTimeSliced } from './graphql';
 import { writeRawToR2, streamCsvExport, cleanupRawDay } from './r2';
 import { toPeriod } from './utils';
+import { REPOLL_DELAYS_H, repollKey, newestEligibleHour } from './repoll';
 
 const VALID_SORT_COLUMNS: Record<string, string> = {
   'name': 'tunnel_name',
@@ -333,10 +334,20 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
     // Per-step last error: last_error_* alone is overwritten by whichever
     // step failed most recently, so an hourly reconcile failure would hide a
     // midnight billing one.
-    const steps: CronStep[] = ['collect', 'retry', 'reconcile', 'billing', 'purge_d1', 'purge_r2'];
+    const steps: CronStep[] = ['collect', 'retry', 'reconcile', 'repoll', 'billing', 'purge_d1', 'purge_r2'];
     const stepErrors = Object.fromEntries(steps.map((s) => {
       const at = get(`last_error_${s}_at`);
       return [s, at === null ? null : { at, message: get(`last_error_${s}_message`) }];
+    }));
+
+    // Late re-poll watermarks, one per delay: how far behind each pass is,
+    // in hours, relative to the newest hour that is due.
+    const repoll = Object.fromEntries(REPOLL_DELAYS_H.map((d) => {
+      const through = get(repollKey(d));
+      const behind = through === null
+        ? null
+        : Math.max(0, Math.round((newestEligibleHour(now, d).getTime() - new Date(through).getTime()) / (60 * 60 * 1000)));
+      return [`${d}h`, { through, hours_behind: behind }];
     }));
 
     const lastTunnelCount = get('last_tunnel_count');
@@ -350,6 +361,7 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
       last_full_run_ok: lastFullRunOk === null ? null : lastFullRunOk === 'true',
       reconciled_through: reconciledThrough,
       hours_behind: hoursBehind,
+      repoll,
       pending_gaps: counts.pending,
       confirmed_empty_7d: counts.confirmedEmpty,
       last_error: lastErrorAt === null ? null : {

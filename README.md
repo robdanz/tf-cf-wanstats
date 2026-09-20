@@ -12,7 +12,9 @@ Cloudflare WAN utilization analytics dashboard. A single Cloudflare Worker polls
 Cron (*/5 * * * *)
   every 5 min (light): 20-min window → D1; retry pending gap buckets
   every hour  (full):  65-min window → D1 + R2; hour ledger (gap discovery,
-                       hourly/daily rollups, R2 rebuild from D1)
+                       hourly/daily rollups, R2 rebuild from D1); late re-poll
+                       of one hour per pass at +14h and +38h (Cloudflare rewrites
+                       buckets ~10-12h after the fact) → D1 + R2 + rollups
   midnight UTC:        billing p95 → D1 retention (chunked) → R2 retention,
                        each step isolated and reported in /api/health
   └─▶ Cloudflare GraphQL API (magicTransitNetworkAnalyticsAdaptiveGroups)
@@ -34,7 +36,7 @@ HTTP (workers.dev)
   POST /api/backfill?start=&end=                 → Upsert one time window (D1+R2, requires X-Backfill-Token)
   GET /api/gaps?start=&end=&status=              → Pending / confirmed-empty 5-min buckets (tunnel_name and
                                                    direction are "*"; a legacy tunnel= filter is ignored)
-  GET /api/health                                → Cron status, ledger watermark, gap counts, per-step last errors
+  GET /api/health                                → Cron status, ledger + re-poll watermarks, gap counts, per-step last errors
 ```
 
 The aggregate p95 mirrors Cloudflare's billing methodology: sum all non-excluded tunnel traffic at each 5-minute interval, then take the p95 of those sums.

@@ -2,6 +2,14 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { env } from 'cloudflare:workers';
 import { handleCron } from '../src/cron';
 import { getMetadata, setMetadata, storeTunnelMetrics, insertGapBuckets, getPendingGapBuckets } from '../src/d1';
+import { repollKey, newestEligibleHour, REPOLL_DELAYS_H } from '../src/repoll';
+import { hourKey } from '../src/reconcile';
+
+// Park both re-poll watermarks at "nothing due" so a full run's row counts
+// below only reflect collect's own window.
+async function parkRepoll(now: Date): Promise<void> {
+  for (const d of REPOLL_DELAYS_H) await setMetadata(DB, repollKey(d), hourKey(newestEligibleHour(now, d)));
+}
 import { applyTestSchema } from './helpers/schema';
 
 const DB = (env as { DB: D1Database }).DB;
@@ -33,7 +41,9 @@ describe('handleCron full run', () => {
 
     await handleCron(TEST_ENV, new Date('2026-08-10T10:01:00Z')); // minute 1 -> full run
 
-    expect(await getMetadata(DB, 'last_error_step')).toBe('collect');
+    expect(await getMetadata(DB, 'last_error_collect_message')).toMatch(/all 13 slice\(s\) failed/);
+    // With GraphQL down the late re-poll stalls too and is recorded on its own key.
+    expect(await getMetadata(DB, 'last_error_repoll_message')).toMatch(/repoll stalled/);
     expect(await getMetadata(DB, 'last_full_run_ok')).toBe('false');
     expect(await getMetadata(DB, 'last_full_run_at')).toBe('2026-08-10T10:01:00.000Z');
     // 08:00 is eligible at 10:01 (08:00 + 2h <= 10:01); 09:00 is not.
@@ -47,6 +57,7 @@ describe('handleCron full run', () => {
     // test's stub and inflate the CRON_OK row count.
     await DB.exec('DELETE FROM gap_buckets');
     await setMetadata(DB, 'reconciled_through', '2026-08-11T07:00:00Z');
+    await parkRepoll(new Date('2026-08-11T10:01:00Z'));
     vi.stubGlobal('fetch', vi.fn().mockImplementation(async (_url: string, init: RequestInit) => {
       const body = JSON.parse(init.body as string) as { variables: { datetimeStart: string } };
       return graphqlRows([{ name: 'CRON_OK', ts: body.variables.datetimeStart.replace('.000Z', 'Z'), rate: 7 }]);
@@ -138,5 +149,32 @@ describe('handleCron full run', () => {
     expect(await getMetadata(DB, 'last_error_purge_d1_message')).toMatch(/tunnel_metrics_hourly/);
     expect(await getMetadata(DB, 'last_error_billing_at')).toBeNull();
     expect(await getMetadata(DB, 'last_full_run_ok')).toBe('false');
+  });
+
+  it('full run re-polls the hours due for each delay and advances their watermarks', async () => {
+    await applyTestSchema(DB);
+    await DB.exec('DELETE FROM gap_buckets');
+    await DB.exec("DELETE FROM cron_metadata WHERE key LIKE 'last_error%'");
+    const now = new Date('2026-08-20T10:01:00Z');
+    await setMetadata(DB, 'reconciled_through', '2026-08-20T07:00:00Z');
+    for (const d of REPOLL_DELAYS_H) {
+      await setMetadata(DB, repollKey(d), hourKey(new Date(newestEligibleHour(now, d).getTime() - 60 * 60 * 1000)));
+    }
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(init.body as string) as { variables: { datetimeStart: string } };
+      return graphqlRows([{ name: 'CRON_REPOLL', ts: body.variables.datetimeStart.replace('.000Z', 'Z'), rate: 7 }]);
+    }));
+
+    await handleCron(TEST_ENV, now);
+
+    for (const d of REPOLL_DELAYS_H) {
+      const h = newestEligibleHour(now, d);
+      expect(await getMetadata(DB, repollKey(d))).toBe(hourKey(h));
+      const n = await DB.prepare('SELECT COUNT(*) AS n FROM tunnel_metrics WHERE tunnel_name = ? AND direction = ? AND ts >= ? AND ts < ?')
+        .bind('CRON_REPOLL', 'ingress', hourKey(h), hourKey(new Date(h.getTime() + 60 * 60 * 1000))).first<{ n: number }>();
+      expect(n?.n).toBe(12);
+    }
+    expect(await getMetadata(DB, 'last_error_repoll_at')).toBeNull();
+    expect(await getMetadata(DB, 'last_full_run_ok')).toBe('true');
   });
 });

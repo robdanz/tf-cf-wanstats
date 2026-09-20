@@ -5,11 +5,13 @@ import { writeRawToR2, computeAggregateBillingP95, purgeOldR2Data } from './r2';
 import { toPeriod } from './utils';
 import { retryPendingGaps } from './gaps';
 import { reconcileHours } from './reconcile';
+import { repollHours } from './repoll';
 
 // Cron fires every 5 minutes. The minute-0 slot is the full run (65-min
-// lookback, R2 write, hour ledger, midnight tasks); every run — light or
-// full — also retries pending gap cells, since a gap can be repaired as soon
-// as its raw data settles rather than waiting for the next full run.
+// lookback, R2 write, hour ledger, late re-poll, midnight tasks); every run
+// — light or full — also retries pending gap buckets, since a gap can be
+// repaired as soon as its raw data settles rather than waiting for the next
+// full run.
 //
 // Every full-run step runs under its own try/catch and records its failure
 // in cron_metadata (last_error_*). A failure in one step never skips the
@@ -51,6 +53,16 @@ export async function handleCron(env: Env, now: Date = new Date()): Promise<void
   } catch (err) {
     ok = false;
     await recordCronError(env.DB, 'reconcile', err);
+  }
+
+  // Late re-poll (repoll.ts): Cloudflare rewrites buckets ~10-12h after the
+  // fact, long after collect's last look. Before the midnight tasks so a
+  // long billing pass cannot starve it; its own deadline keeps it short.
+  try {
+    await repollHours(env, now);
+  } catch (err) {
+    ok = false;
+    await recordCronError(env.DB, 'repoll', err);
   }
 
   if (now.getUTCHours() === 0) {

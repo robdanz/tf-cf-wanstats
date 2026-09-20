@@ -15,7 +15,8 @@ type HealthBody = {
   last_cron_run: string | null; last_tunnel_count: number | null; last_full_run_at: string | null;
   last_full_run_ok: boolean | null; reconciled_through: string | null; hours_behind: number | null;
   pending_gaps: number; confirmed_empty_7d: number; last_error: { at: string; step: string; message: string } | null;
-  step_errors: Record<'collect' | 'retry' | 'reconcile' | 'billing' | 'purge_d1' | 'purge_r2', StepError>;
+  step_errors: Record<'collect' | 'retry' | 'reconcile' | 'repoll' | 'billing' | 'purge_d1' | 'purge_r2', StepError>;
+  repoll: Record<string, { through: string | null; hours_behind: number | null }>;
 };
 
 async function get(path: string): Promise<Response> {
@@ -73,7 +74,8 @@ describe('/api/health', () => {
     expect(body.reconciled_through).toBeNull();
     expect(body.hours_behind).toBeNull();
     expect(body.last_error).toBeNull();
-    expect(body.step_errors).toEqual({ collect: null, retry: null, reconcile: null, billing: null, purge_d1: null, purge_r2: null });
+    expect(body.step_errors).toEqual({ collect: null, retry: null, reconcile: null, repoll: null, billing: null, purge_d1: null, purge_r2: null });
+    expect(body.repoll).toEqual({ '14h': { through: null, hours_behind: null }, '38h': { through: null, hours_behind: null } });
   });
 
   it('reflects metadata keys, computes hours_behind, counts buckets, and exposes per-step errors', async () => {
