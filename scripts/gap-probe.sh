@@ -39,8 +39,9 @@
 # tunnel's normal cadence around the gap is visible.
 #
 # Timestamp semantics: the consumer export shape is read as "data resumed at
-# T after a gap of N minutes" (the gap is BEFORE T). The 4-column shape is
-# read as "last row at T, then N minutes missing" (the gap is AFTER T).
+# T, N minutes after the previous row" (missing buckets T-N+5m .. T-5m). The
+# 4-column shape is read as "last row at T, then N minutes missing" (missing
+# buckets T+5m .. T+N).
 # GAP_BEFORE=1 or GAP_BEFORE=0 overrides for every line.
 #
 # Once raw D1 rows have aged out (7 days) R2 is the store of record and the
@@ -406,7 +407,9 @@ while IFS=$'\t' read -r idx tunnel dir ws we last_seen gap_min before; do
     def fmt: if . == null then "." else (. | round | tostring) end;
     ($s | epoch) as $se | ($e | epoch) as $ee
     | ($ls | epoch) as $lse
-    | (if $before == 1 then $lse - $gap * 60 else $lse + 300 end) as $miss_start
+    # Consumer shape: gap N is measured from the last row'"'"'s bucket to the
+    # resume bucket, so the first missing bucket is T - N + 5m.
+    | (if $before == 1 then $lse - $gap * 60 + 300 else $lse + 300 end) as $miss_start
     | (if $before == 1 then $lse else $lse + $gap * 60 end) as $miss_end
     | (if $r2 == null then null else ($r2 | map(select(.dir == $dir)) | map({key: .ts, value: .v}) | from_entries) end) as $R
     | ($gql_ran == 1 and $gql_total > 0) as $source_ok
