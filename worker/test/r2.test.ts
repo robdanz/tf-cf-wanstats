@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { env } from 'cloudflare:workers';
-import { writeRawToR2 } from '../src/r2';
+import { bucketsWithRows, writeRawToR2 } from '../src/r2';
 import type { NormalizedRow } from '../src/types';
 
 const BUCKET = (env as { RAW_METRICS: R2Bucket }).RAW_METRICS;
@@ -125,5 +125,37 @@ describe('writeRawToR2 concurrent writers', () => {
     });
     await expect(writeRawToR2(alwaysLosing, [row('TUN_LOSE', '2026-02-03T08:00:00Z', 1)], []))
       .rejects.toThrow(/raw\/2026-02-03\/08\.csv/);
+  });
+});
+
+
+describe('writeRawToR2 replace-by-bucket', () => {
+  it('drops stored rows for the listed buckets that the incoming set lacks, and leaves other buckets merged', async () => {
+    const key = 'raw/2026-05-05/10.csv';
+    await BUCKET.put(key, [
+      'tunnel_name,direction,ts,bit_rate',
+      'KEEP,ingress,2026-05-05T10:00:00Z,1',
+      'GONE,egress,2026-05-05T10:00:00Z,2',
+      'OTHER,ingress,2026-05-05T10:05:00Z,3',
+      '',
+    ].join('\n'));
+    const ingress = [{ tunnelName: 'KEEP', ts: '2026-05-05T10:00:00Z', bitRate: 9 }];
+    const egress: typeof ingress = [];
+
+    await writeRawToR2(BUCKET, ingress, egress, bucketsWithRows(ingress, egress));
+
+    const lines = (await (await BUCKET.get(key))!.text()).trim().split('\n').slice(1).sort();
+    expect(lines).toEqual([
+      'KEEP,ingress,2026-05-05T10:00:00Z,9',   // replaced value
+      'OTHER,ingress,2026-05-05T10:05:00Z,3',  // bucket not in the replace set: untouched
+    ]);
+  });
+
+  it('without a replace set still merges (a stale row survives)', async () => {
+    const key = 'raw/2026-05-06/10.csv';
+    await BUCKET.put(key, 'tunnel_name,direction,ts,bit_rate\nGONE,egress,2026-05-06T10:00:00Z,2\n');
+    await writeRawToR2(BUCKET, [{ tunnelName: 'KEEP', ts: '2026-05-06T10:00:00Z', bitRate: 1 }], []);
+    const text = await (await BUCKET.get(key))!.text();
+    expect(text).toContain('GONE,egress,2026-05-06T10:00:00Z,2');
   });
 });

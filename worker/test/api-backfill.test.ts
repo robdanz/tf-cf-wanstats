@@ -46,6 +46,31 @@ describe('POST /api/backfill success', () => {
   });
 });
 
+describe('POST /api/backfill replace semantics', () => {
+  it('removes D1 and R2 rows the source no longer returns for buckets it answered', async () => {
+    await applyTestSchema(DB);
+    const { storeTunnelMetrics } = await import('../src/d1');
+    await storeTunnelMetrics(DB, [{ tunnelName: 'BF_GONE', ts: '2026-08-01T00:00:00Z', bitRate: 5 }], 'egress', '2026-08-01T00:06:00.000Z');
+    await BUCKET.put('raw/2026-08-01/00.csv', 'tunnel_name,direction,ts,bit_rate\nBF_GONE,egress,2026-08-01T00:00:00Z,5\n');
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(init.body as string) as { variables: { datetimeStart: string } };
+      const ts = body.variables.datetimeStart.replace('.000Z', 'Z');
+      return Response.json({ data: { viewer: { accounts: [{
+        ingress: [{ avg: { bitRateFiveMinutes: 1 }, dimensions: { datetimeFiveMinutes: ts, ingressTunnelName: 'BF_NEW' } }],
+        egress: [],
+      }] } } });
+    }));
+
+    // The fixture window (2026-08-01) is older than raw retention, so this exercises R2 replace in archive mode;
+    // D1 pruning in raw mode is covered by the repoll test.
+    const res = await handleApiRequest(backfillRequest(), TEST_ENV);
+    expect(res.status).toBe(200);
+    const text = await (await BUCKET.get('raw/2026-08-01/00.csv'))!.text();
+    expect(text).not.toContain('BF_GONE,');
+    expect(text).toContain('BF_NEW,ingress,2026-08-01T00:00:00Z,1');
+  });
+});
+
 describe('POST /api/backfill archive mode (older than raw retention)', () => {
   it('writes R2 and rollups from the fetched rows but no raw D1 rows', async () => {
     await applyTestSchema(DB);

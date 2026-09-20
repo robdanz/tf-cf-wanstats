@@ -20,7 +20,8 @@ Cron (*/5 * * * *)
   └─▶ Cloudflare GraphQL API (magicTransitNetworkAnalyticsAdaptiveGroups)
         time-sliced per 5-min bucket, GRAPHQL_LIMIT=3000, ingress + egress aliases
   └─▶ D1 (INSERT OR REPLACE — tunnel_metrics, raw 5-min rows)
-  └─▶ R2 (raw/YYYY-MM-DD/HH.csv — one object per hour)
+  └─▶ R2 (raw/YYYY-MM-DD/HH.csv — one object per hour; re-fetch paths replace
+        each answered 5-min bucket so R2 == Cloudflare for the 16 weeks it serves)
   └─▶ D1 gap_buckets — a 5-min bucket with no rows in any direction (a failed
         GraphQL slice affects every tunnel; idle tunnels are not gaps)
 

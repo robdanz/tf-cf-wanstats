@@ -135,6 +135,35 @@ describe('repollHours', () => {
     expect(daily).toEqual({ sample_count: 12, avg_bit_rate: 9 });
   });
 
+  it('removes rows the source no longer returns, but keeps rows of a bucket the source answers empty', async () => {
+    await applyTestSchema(DB);
+    await clearRepollState();
+    const now = new Date('2026-09-20T16:30:00Z'); // 14h -> hour 01:00 on 09-20
+    await setMetadata(DB, repollKey(38), '2026-09-19T01:00:00Z'); // nothing due
+    // Stored earlier: DROPPED at 01:00 (source will not return it), STAYS at 01:30 (source returns nothing for that bucket).
+    await storeTunnelMetrics(DB, [
+      { tunnelName: 'DROPPED', ts: '2026-09-20T01:00:00Z', bitRate: 5 },
+      { tunnelName: 'STAYS', ts: '2026-09-20T01:30:00Z', bitRate: 5 },
+    ], 'egress', '2026-09-20T02:05:00.000Z');
+    await BUCKET.put('raw/2026-09-20/01.csv', 'tunnel_name,direction,ts,bit_rate\nDROPPED,egress,2026-09-20T01:00:00Z,5\nSTAYS,egress,2026-09-20T01:30:00Z,5\n');
+    // Source now: REPOLL_F ingress in every bucket except 01:30, which is empty.
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(init.body as string) as { variables: { datetimeStart: string } };
+      const ts = body.variables.datetimeStart.replace('.000Z', 'Z');
+      const rows = ts === '2026-09-20T01:30:00Z' ? [] : [{ avg: { bitRateFiveMinutes: 1 }, dimensions: { datetimeFiveMinutes: ts, ingressTunnelName: 'REPOLL_F' } }];
+      return Response.json({ data: { viewer: { accounts: [{ ingress: rows, egress: [] }] } } });
+    }));
+
+    await repollHours(TEST_ENV, now);
+
+    const names = await DB.prepare("SELECT tunnel_name || '@' || ts AS k FROM tunnel_metrics WHERE direction = 'egress' AND ts >= '2026-09-20T01:00:00Z' AND ts < '2026-09-20T02:00:00Z' ORDER BY k").all<{ k: string }>();
+    expect(names.results.map((r) => r.k)).toEqual(['STAYS@2026-09-20T01:30:00Z']);
+    const text = await (await BUCKET.get('raw/2026-09-20/01.csv'))!.text();
+    expect(text).not.toContain('DROPPED,');
+    expect(text).toContain('STAYS,egress,2026-09-20T01:30:00Z,5');
+    expect(text).toContain('REPOLL_F,ingress,2026-09-20T01:00:00Z,1');
+  });
+
   it('clamps a watermark older than raw retention', async () => {
     await applyTestSchema(DB);
     await clearRepollState();

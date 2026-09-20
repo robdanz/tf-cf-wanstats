@@ -9,6 +9,8 @@ import {
   getBillingP95Summary,
   getBillingP95Tunnels,
   storeTunnelMetrics,
+  pruneRawRows,
+  keepKeys,
   rollupHour,
   rollupHourFromRows,
   rollupDay,
@@ -21,7 +23,7 @@ import {
   CHANGED_SINCE_GROUP_SQL,
 } from './d1';
 import { fetchMetricsTimeSliced } from './graphql';
-import { writeRawToR2, streamCsvExport, cleanupRawDay } from './r2';
+import { writeRawToR2, bucketsWithRows, streamCsvExport, cleanupRawDay } from './r2';
 import { toPeriod, snapToHour, snapToDay } from './utils';
 import { REPOLL_DELAYS_H, repollKey, newestEligibleHour } from './repoll';
 
@@ -532,12 +534,15 @@ async function handleBackfill(request: Request, env: Env): Promise<Response> {
   const rawCutoff = now.getTime() - 7 * 24 * 60 * 60 * 1000;
   const archiveOnly = new Date(end).getTime() <= rawCutoff;
 
+  // Replace, not merge, for every bucket the source answered for: R2 (and
+  // D1 within retention) end up exactly equal to the source for the window.
+  const replace = bucketsWithRows(ingress, egress);
   await Promise.all([
     archiveOnly ? Promise.resolve() : Promise.all([
       storeTunnelMetrics(env.DB, ingress, 'ingress'),
       storeTunnelMetrics(env.DB, egress, 'egress'),
-    ]),
-    writeRawToR2(env.RAW_METRICS, ingress, egress),
+    ]).then(() => pruneRawRows(env.DB, replace, keepKeys(ingress, egress))),
+    writeRawToR2(env.RAW_METRICS, ingress, egress, replace),
   ]);
 
   // The raw rows just changed; the rollups derived from them must follow or

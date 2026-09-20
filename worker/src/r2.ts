@@ -45,12 +45,23 @@ async function mergeIntoHourFile(
   bucket: R2Bucket,
   objectKey: string,
   incoming: Map<string, string>,
+  replaceBuckets: Set<string>,
 ): Promise<number> {
   for (let attempt = 1; attempt <= MAX_PUT_ATTEMPTS; attempt++) {
     const existingObj = await bucket.get(objectKey);
     const merged = existingObj
       ? collapseMaxPerKey(await existingObj.text()).lines
       : new Map<string, string>();
+
+    // Replace semantics for buckets the source answered for: whatever the
+    // file held for that 5-min ts is dropped before the fresh rows go in, so
+    // a tunnel the source no longer returns disappears here too. The line
+    // key is tunnel,direction,ts — ts is the part after the last comma.
+    if (replaceBuckets.size > 0) {
+      for (const lineKey of Array.from(merged.keys())) {
+        if (replaceBuckets.has(lineKey.slice(lineKey.lastIndexOf(',') + 1))) merged.delete(lineKey);
+      }
+    }
 
     for (const [lineKey, line] of incoming) merged.set(lineKey, line);
 
@@ -70,10 +81,25 @@ async function mergeIntoHourFile(
   throw new Error(`R2 ${objectKey}: gave up after ${MAX_PUT_ATTEMPTS} concurrent-write retries`);
 }
 
+// Buckets (raw ts) whose stored rows must be replaced by the incoming rows
+// rather than merged with them. Callers that re-fetched a bucket from the
+// source and got rows back pass it here; a bucket that came back empty is
+// never passed (an empty answer can be transient, and replacing with
+// nothing would wipe an hour the collector had captured).
+export type ReplaceBuckets = Set<string>;
+
+export function bucketsWithRows(ingress: NormalizedRow[], egress: NormalizedRow[]): ReplaceBuckets {
+  const set = new Set<string>();
+  for (const r of ingress) set.add(r.ts);
+  for (const r of egress) set.add(r.ts);
+  return set;
+}
+
 export async function writeRawToR2(
   bucket: R2Bucket,
   ingress: NormalizedRow[],
   egress: NormalizedRow[],
+  replaceBuckets: ReplaceBuckets = new Set(),
 ): Promise<{ filesWritten: number; totalRows: number }> {
   // Per hour file: rows keyed by tunnel,direction,ts. A bucket re-fetched
   // with a different (settled) value must replace the old line, not coexist
@@ -95,10 +121,19 @@ export async function writeRawToR2(
 
   addRows(ingress, 'ingress');
   addRows(egress, 'egress');
+  // An hour that only has buckets to replace (no incoming rows) cannot
+  // happen by construction (replace buckets always carry rows), but make
+  // sure such an hour would still be visited rather than silently skipped.
+  for (const ts of replaceBuckets) {
+    const key = `${ts.slice(0, 10)}/${ts.slice(11, 13)}`;
+    if (!hourBuckets.has(key)) hourBuckets.set(key, new Map());
+  }
 
   let totalRows = 0;
   for (const [key, incoming] of hourBuckets) {
-    totalRows += await mergeIntoHourFile(bucket, `raw/${key}.csv`, incoming);
+    const hourPrefix = `${key.slice(0, 10)}T${key.slice(11, 13)}:`;
+    const replaceInHour = new Set(Array.from(replaceBuckets).filter((ts) => ts.startsWith(hourPrefix)));
+    totalRows += await mergeIntoHourFile(bucket, `raw/${key}.csv`, incoming, replaceInHour);
   }
 
   return { filesWritten: hourBuckets.size, totalRows };

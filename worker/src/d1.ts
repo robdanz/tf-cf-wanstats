@@ -38,6 +38,41 @@ export async function storeTunnelMetrics(
   }
 }
 
+// Delete raw rows in the given buckets that the source no longer returns:
+// the D1 side of R2's replace-by-bucket. `keep` holds the keys
+// (tunnel|direction|ts) the source did return. One exact (direction, ts)
+// index probe per bucket and direction, then PK deletes in batches; the
+// deleted set is normally a handful of low-rate tunnels per hour.
+export async function pruneRawRows(
+  db: D1Database,
+  buckets: Set<string>,
+  keep: Set<string>,
+): Promise<number> {
+  const toDelete: Array<{ tunnelName: string; direction: string; ts: string }> = [];
+  for (const ts of buckets) {
+    for (const direction of ['ingress', 'egress'] as const) {
+      const { results } = await db.prepare('SELECT tunnel_name FROM tunnel_metrics WHERE direction = ? AND ts = ?')
+        .bind(direction, ts).all<{ tunnel_name: string }>();
+      for (const r of results) {
+        if (!keep.has(`${r.tunnel_name}|${direction}|${ts}`)) toDelete.push({ tunnelName: r.tunnel_name, direction, ts });
+      }
+    }
+  }
+  for (let i = 0; i < toDelete.length; i += BATCH_SIZE) {
+    await db.batch(toDelete.slice(i, i + BATCH_SIZE).map((d) =>
+      db.prepare('DELETE FROM tunnel_metrics WHERE tunnel_name = ? AND direction = ? AND ts = ?').bind(d.tunnelName, d.direction, d.ts),
+    ));
+  }
+  return toDelete.length;
+}
+
+export function keepKeys(ingress: NormalizedRow[], egress: NormalizedRow[]): Set<string> {
+  const keep = new Set<string>();
+  for (const r of ingress) keep.add(`${r.tunnelName}|ingress|${r.ts}`);
+  for (const r of egress) keep.add(`${r.tunnelName}|egress|${r.ts}`);
+  return keep;
+}
+
 // Both rollups read their source as two per-direction halves so
 // idx_tm_direction_ts / idx_tmh_direction_ts apply: a bare `ts >= ? AND ts < ?`
 // scans the whole table (millions of rows at 1000+ tunnels) against D1's 30 s
