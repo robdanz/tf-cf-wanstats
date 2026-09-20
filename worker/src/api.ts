@@ -9,6 +9,8 @@ import {
   getBillingP95Summary,
   getBillingP95Tunnels,
   storeTunnelMetrics,
+  rollupHour,
+  rollupDay,
   getGapBuckets,
   getGapBucketCounts,
   getGapBucketRangeCounts,
@@ -19,7 +21,7 @@ import {
 } from './d1';
 import { fetchMetricsTimeSliced } from './graphql';
 import { writeRawToR2, streamCsvExport, cleanupRawDay } from './r2';
-import { toPeriod } from './utils';
+import { toPeriod, snapToHour, snapToDay } from './utils';
 import { REPOLL_DELAYS_H, repollKey, newestEligibleHour } from './repoll';
 
 const VALID_SORT_COLUMNS: Record<string, string> = {
@@ -526,6 +528,27 @@ async function handleBackfill(request: Request, env: Env): Promise<Response> {
     writeRawToR2(env.RAW_METRICS, ingress, egress),
   ]);
 
+  // The raw rows just changed; the rollups derived from them must follow or
+  // the 7d/30d/90d views keep showing the pre-backfill values. Hours in the
+  // window are rewritten; a day is rewritten only when it is complete, since
+  // the daily table is only ever written as a whole-day aggregate.
+  const rolledHours: string[] = [];
+  const rolledDays: string[] = [];
+  const todayStart = snapToDay(new Date()).getTime();
+  const days = new Set<string>();
+  for (let h = snapToHour(new Date(start)).getTime(); h < new Date(end).getTime(); h += 60 * 60 * 1000) {
+    const hour = new Date(h).toISOString();
+    await rollupHour(env.DB, hour);
+    rolledHours.push(hour);
+    days.add(snapToDay(new Date(h)).toISOString());
+  }
+  for (const day of days) {
+    if (new Date(day).getTime() + 24 * 60 * 60 * 1000 <= todayStart) {
+      await rollupDay(env.DB, day);
+      rolledDays.push(day);
+    }
+  }
+
   return Response.json({
     start,
     end,
@@ -533,5 +556,7 @@ async function handleBackfill(request: Request, env: Env): Promise<Response> {
     egress_rows: egress.length,
     failed_slices: failedSlices,
     warnings,
+    rolled_up_hours: rolledHours,
+    rolled_up_days: rolledDays,
   });
 }

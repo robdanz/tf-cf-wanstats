@@ -18,6 +18,34 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+describe('POST /api/backfill success', () => {
+  it('stores rows and rewrites the hourly and (complete-day) daily rollups it touched', async () => {
+    await applyTestSchema(DB);
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(init.body as string) as { variables: { datetimeStart: string } };
+      const ts = body.variables.datetimeStart.replace('.000Z', 'Z');
+      return Response.json({ data: { viewer: { accounts: [{
+        ingress: [{ avg: { bitRateFiveMinutes: 42 }, dimensions: { datetimeFiveMinutes: ts, ingressTunnelName: 'BF_ROLL' } }],
+        egress: [],
+      }] } } });
+    }));
+
+    const res = await handleApiRequest(backfillRequest(), TEST_ENV);
+    expect(res.status).toBe(200);
+    const body = await res.json() as { ingress_rows: number; rolled_up_hours: string[]; rolled_up_days: string[] };
+    expect(body.ingress_rows).toBe(2);
+    expect(body.rolled_up_hours).toEqual(['2026-08-01T00:00:00.000Z']);
+    expect(body.rolled_up_days).toEqual(['2026-08-01T00:00:00.000Z']);
+
+    const hourly = await DB.prepare('SELECT avg_bit_rate, sample_count FROM tunnel_metrics_hourly WHERE tunnel_name = ? AND direction = ? AND ts = ?')
+      .bind('BF_ROLL', 'ingress', '2026-08-01T00:00:00.000Z').first<{ avg_bit_rate: number; sample_count: number }>();
+    expect(hourly).toEqual({ avg_bit_rate: 42, sample_count: 2 });
+    const daily = await DB.prepare('SELECT sample_count FROM tunnel_metrics_daily WHERE tunnel_name = ? AND direction = ? AND ts = ?')
+      .bind('BF_ROLL', 'ingress', '2026-08-01T00:00:00.000Z').first<{ sample_count: number }>();
+    expect(daily?.sample_count).toBe(2);
+  });
+});
+
 describe('POST /api/backfill total failure', () => {
   it('returns 429 with failed_slices when every slice is rate limited', async () => {
     await applyTestSchema(DB);
