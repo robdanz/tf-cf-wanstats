@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { env } from 'cloudflare:workers';
-import { repollHours, repollKey, newestEligibleHour, REPOLL_DELAYS_H, MAX_REPOLL_HOURS_PER_PASS } from '../src/repoll';
-import { storeTunnelMetrics, setMetadata, getMetadata } from '../src/d1';
+import { repollHours, repollKey, newestEligibleHour, REPOLL_DELAYS_H, MAX_REPOLL_HOURS_PER_PASS, INITIAL_CATCHUP_H } from '../src/repoll';
+import { storeTunnelMetrics, setMetadata, getMetadata, insertGapBuckets, getPendingGapBuckets } from '../src/d1';
 import { applyTestSchema } from './helpers/schema';
 
 const DB = (env as { DB: D1Database }).DB;
@@ -46,13 +46,15 @@ describe('newestEligibleHour', () => {
 });
 
 describe('repollHours', () => {
-  it('first run re-polls exactly one hour per delay and stores what the source has now', async () => {
+  it('first run starts INITIAL_CATCHUP_H back and stores what the source has now', async () => {
     await applyTestSchema(DB);
     await clearRepollState();
     const now = new Date('2026-09-20T16:30:00Z');
-    // 14h pass -> hour 01:00; 38h pass -> 2026-09-19T01:00.
+    // 14h newest = 09-20 01:00; first run starts 26h earlier and walks 3 hours: 09-18 23:00 .. 09-19 01:00.
+    // Pin the 14h pass so this test's assertions on hour 01:00 hold; let the 38h pass do its first-run catch-up.
+    await setMetadata(DB, repollKey(14), '2026-09-20T00:00:00Z');
     const h14 = '2026-09-20T01:00:00Z';
-    const h38 = '2026-09-19T01:00:00Z';
+    const h38 = '2026-09-18T01:00:00Z'; // 38h newest = 09-19 01:00, minus 26h = 09-17 23:00, +3 hours -> 09-18 02:00? see below
     // What the collector stored at the time: 12 buckets at rate 5 for REPOLL_A, no row for REPOLL_LATE.
     const rows = [];
     for (let i = 0; i < 12; i++) rows.push({ tunnelName: 'REPOLL_A', ts: `2026-09-20T01:${String(i * 5).padStart(2, '0')}:00Z`, bitRate: 5 });
@@ -62,9 +64,12 @@ describe('repollHours', () => {
 
     const results = await repollHours(TEST_ENV, now);
 
-    expect(results.map((r) => [r.delayH, r.processed, r.hoursBehind, r.through])).toEqual([[14, 1, 0, h14], [38, 1, 0, h38]]);
+    // 38h pass: watermark 09-19 01:00 - 26h = 09-17 23:00; processes 00:00, 01:00, 02:00 on 09-18; 23 hours still behind.
+    expect(results.map((r) => [r.delayH, r.processed, r.hoursBehind, r.through]))
+      .toEqual([[14, 1, 0, h14], [38, MAX_REPOLL_HOURS_PER_PASS, INITIAL_CATCHUP_H - MAX_REPOLL_HOURS_PER_PASS, '2026-09-18T02:00:00Z']]);
     expect(await getMetadata(DB, repollKey(14))).toBe(h14);
-    expect(await getMetadata(DB, repollKey(38))).toBe(h38);
+    expect(await getMetadata(DB, repollKey(38))).toBe('2026-09-18T02:00:00Z');
+    void h38;
 
     const late = await DB.prepare('SELECT bit_rate FROM tunnel_metrics WHERE tunnel_name = ? AND direction = ? AND ts = ?')
       .bind('REPOLL_LATE', 'ingress', '2026-09-20T01:20:00Z').first<{ bit_rate: number }>();
@@ -139,6 +144,7 @@ describe('repollHours', () => {
     await applyTestSchema(DB);
     await clearRepollState();
     const now = new Date('2026-09-20T16:30:00Z'); // 14h -> hour 01:00 on 09-20
+    await setMetadata(DB, repollKey(14), '2026-09-20T00:00:00Z'); // due: 01:00 only
     await setMetadata(DB, repollKey(38), '2026-09-19T01:00:00Z'); // nothing due
     // Stored earlier: DROPPED at 01:00 (source will not return it), STAYS at 01:30 (source returns nothing for that bucket).
     await storeTunnelMetrics(DB, [
@@ -162,6 +168,29 @@ describe('repollHours', () => {
     expect(text).not.toContain('DROPPED,');
     expect(text).toContain('STAYS,egress,2026-09-20T01:30:00Z,5');
     expect(text).toContain('REPOLL_F,ingress,2026-09-20T01:00:00Z,1');
+  });
+
+  it('clears gap_buckets for buckets the source now answers with rows', async () => {
+    await applyTestSchema(DB);
+    await clearRepollState();
+    await DB.exec('DELETE FROM gap_buckets');
+    const now = new Date('2026-09-20T16:30:00Z');
+    await setMetadata(DB, repollKey(14), '2026-09-20T00:00:00Z'); // due: 01:00
+    await setMetadata(DB, repollKey(38), '2026-09-19T01:00:00Z'); // nothing due
+    await insertGapBuckets(DB, [{ ts: '2026-09-20T01:10:00Z' }, { ts: '2026-09-20T01:15:00Z' }], '2026-09-20T03:00:00Z');
+    // Source answers every bucket except 01:15 (still empty -> still a gap).
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(init.body as string) as { variables: { datetimeStart: string } };
+      const ts = body.variables.datetimeStart.replace('.000Z', 'Z');
+      const rows = ts === '2026-09-20T01:15:00Z' ? [] : [{ avg: { bitRateFiveMinutes: 1 }, dimensions: { datetimeFiveMinutes: ts, ingressTunnelName: 'REPOLL_G' } }];
+      return Response.json({ data: { viewer: { accounts: [{ ingress: rows, egress: [] }] } } });
+    }));
+
+    await repollHours(TEST_ENV, now);
+
+    const pending = (await getPendingGapBuckets(DB, 100, new Date('2030-01-01T00:00:00Z'))).map((p) => p.ts);
+    expect(pending).not.toContain('2026-09-20T01:10:00Z');
+    expect(pending).toContain('2026-09-20T01:15:00Z');
   });
 
   it('clamps a watermark older than raw retention', async () => {

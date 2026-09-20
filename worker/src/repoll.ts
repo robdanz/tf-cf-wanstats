@@ -1,6 +1,6 @@
 import type { Env } from './types';
 import { fetchMetricsTimeSliced } from './graphql';
-import { storeTunnelMetrics, pruneRawRows, keepKeys, rollupHour, rollupDay, getMetadata, setMetadata } from './d1';
+import { storeTunnelMetrics, pruneRawRows, keepKeys, rollupHour, rollupDay, getMetadata, setMetadata, deleteResolvedGapBuckets } from './d1';
 import { writeRawToR2, bucketsWithRows } from './r2';
 import { snapToHour, snapToDay } from './utils';
 import { hourKey } from './reconcile';
@@ -29,6 +29,10 @@ import { hourKey } from './reconcile';
 
 export const REPOLL_DELAYS_H = [14, 38];
 export const MAX_REPOLL_HOURS_PER_PASS = 3;
+// First run of a pass starts this far behind the newest due hour, so the
+// hours collected before the re-poll existed (up to a day) are covered
+// without a manual backfill. 26 hours = 9 full runs of catch-up at 3/run.
+export const INITIAL_CATCHUP_H = 26;
 const HOUR_MS = 60 * 60 * 1000;
 const RAW_RETENTION_MS = 7 * 24 * HOUR_MS;
 
@@ -71,6 +75,10 @@ async function repollHour(env: Env, hour: Date): Promise<{ ok: boolean; ingress:
     writeRawToR2(env.RAW_METRICS, ingress, egress, replace),
   ]);
 
+  // A bucket that has rows now is no longer a gap, whatever the retry
+  // schedule concluded about it.
+  if (replace.size > 0) await deleteResolvedGapBuckets(env.DB, Array.from(replace).map((ts) => ({ ts })));
+
   await rollupHour(env.DB, hour.toISOString());
   if (hour.getUTCHours() === 23) {
     await rollupDay(env.DB, snapToDay(hour).toISOString());
@@ -86,10 +94,8 @@ async function repollPass(env: Env, now: Date, delayH: number, deadlineAt: numbe
   let watermark: Date;
   const parsed = stored === null ? NaN : new Date(stored).getTime();
   if (isNaN(parsed)) {
-    // First run (or garbage): start with exactly one hour, no catch-up. The
-    // hours before it were already served as-is to consumers; re-fetching a
-    // week of history is 2000 GraphQL calls for a ~0.03% change in bits.
-    watermark = new Date(newest.getTime() - HOUR_MS);
+    // First run (or garbage): catch up the last INITIAL_CATCHUP_H hours.
+    watermark = new Date(newest.getTime() - INITIAL_CATCHUP_H * HOUR_MS);
   } else {
     watermark = snapToHour(new Date(parsed));
   }
