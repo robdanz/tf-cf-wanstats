@@ -43,9 +43,15 @@
 #   ACCOUNT_ID            Cloudflare account ID
 #
 # Optional:
-#   D1_API_TOKEN          token wrangler uses for D1 (the terraform deploy
-#                         token works); defaults to CLOUDFLARE_API_TOKEN.
+#   D1_API_TOKEN          token wrangler uses for D1 and R2 (the terraform
+#                         deploy token works); defaults to CLOUDFLARE_API_TOKEN.
 #                         Set D1=0 to skip the D1 sections.
+#   GQL=0                 skip the GraphQL pass (R2-vs-D1 audit only; cheap)
+#   R2_VIA                "export" (default: /api/export, needs WORKER_URL and
+#                         Access headers if gated) or "wrangler" (reads the
+#                         hour objects raw/YYYY-MM-DD/HH.csv with the deploy
+#                         token; needs R2_BUCKET, default tf-cf-wanstats-raw-metrics).
+#                         Falls back to wrangler when the export is refused.
 #   WORKER_DIR            directory holding the rendered wrangler.jsonc
 #                         (default: ../worker relative to this script)
 #   D1_DATABASE           D1 database name (default tf-cf-wanstats-metrics)
@@ -75,6 +81,9 @@ WORKER_DIR="${WORKER_DIR:-$SCRIPT_DIR/../worker}"
 D1_DATABASE="${D1_DATABASE:-tf-cf-wanstats-metrics}"
 D1_API_TOKEN="${D1_API_TOKEN:-$CLOUDFLARE_API_TOKEN}"
 D1="${D1:-1}"
+GQL="${GQL:-1}"
+R2_VIA="${R2_VIA:-export}"
+R2_BUCKET="${R2_BUCKET:-tf-cf-wanstats-raw-metrics}"
 PROBE_SLEEP="${PROBE_SLEEP:-0.5}"
 TZ_OFFSET_MIN="${TZ_OFFSET_MIN:-0}"
 MAX_BUCKETS=288
@@ -164,6 +173,11 @@ GQL_QUERY='query($a:String!,$s:Time!,$e:Time!){viewer{accounts(filter:{accountTa
   ingress: magicTransitNetworkAnalyticsAdaptiveGroups(limit: 3000, orderBy: [datetimeFiveMinutes_ASC], filter:{datetime_geq:$s, datetime_lt:$e, ingressTunnelName_notin:["","device_id"]}) { avg { bitRateFiveMinutes } dimensions { datetimeFiveMinutes ingressTunnelName } }
   egress:  magicTransitNetworkAnalyticsAdaptiveGroups(limit: 3000, orderBy: [datetimeFiveMinutes_ASC], filter:{datetime_geq:$s, datetime_lt:$e, egressTunnelName_notin:["","device_id"]}) { avg { bitRateFiveMinutes } dimensions { datetimeFiveMinutes egressTunnelName } } } } }'
 
+cut -c1-13 "$WORK/buckets.txt" | sort -u >"$WORK/hours.txt"
+
+if [[ "$GQL" == "0" ]]; then
+  echo "GraphQL pass skipped (GQL=0)"; echo '[]' >"$WORK/gql.json"
+else
 printf "Fetching %s GraphQL slice(s)" "$BUCKET_COUNT"
 i=0
 while IFS= read -r ts; do
@@ -182,6 +196,7 @@ while IFS= read -r ts; do
 done <"$WORK/buckets.txt"
 echo " done"
 cat "$WORK"/gql/*.json | jq -sc '.' >"$WORK/gql.json"
+fi
 
 # ── D1 via wrangler: rows per hour covering the buckets, plus gap_buckets ───
 d1_query() {
@@ -195,7 +210,6 @@ d1_query() {
 
 D1_OK=false
 if [[ "$D1" != "0" ]]; then
-  cut -c1-13 "$WORK/buckets.txt" | sort -u >"$WORK/hours.txt"
   printf "Fetching D1 rows for %s hour(s)" "$(wc -l <"$WORK/hours.txt" | tr -d ' ')"
   D1_OK=true
   while IFS= read -r hp; do
@@ -232,6 +246,7 @@ JQ_PRELUDE='
 '
 
 # ── population + revision table ─────────────────────────────────────────────
+if [[ "$GQL" != "0" ]]; then
 echo "== Per bucket: rows in D1 vs GraphQL now.  +N rows at source only, -N in D1 only, ~N value changed (>0.5%)"
 jq -r --slurpfile gqlf "$WORK/gql.json" --slurpfile d1f "$WORK/d1.json" --slurpfile gapsf "$WORK/gaps_d1.json" \
   --rawfile buckets "$WORK/buckets.txt" -n '
@@ -269,35 +284,95 @@ jq -r --slurpfile gqlf "$WORK/gql.json" --slurpfile d1f "$WORK/d1.json" --slurpf
 ' >"$WORK/pop.txt" 2>"$WORK/pop.err" || { echo "  population table failed:"; cat "$WORK/pop.err"; }
 cat "$WORK/pop.txt"
 echo
+fi
+
+# ── R2 via /api/export: one export for the whole probed range, all tunnels ──
+# Compared per hour (one R2 object per hour) against D1. Light runs write D1
+# only; the minute-0 full run writes R2 for the previous 65 min, and the
+# ledger rebuilds each hour's object from D1 ~2h after the hour. A consumer
+# reading R2 sees an hour settle in two steps: H+1h (full run) and H+2..3h
+# (ledger). Anything still missing after that is a real gap between stores.
+echo null >"$WORK/r2.json"
+R2_OK=false
+if [[ "$R2_VIA" == "export" && -n "${WORKER_URL:-}" ]]; then
+  printf "Fetching R2 export %s -> %s" "$RANGE_START" "$RANGE_END"
+  code=$(curl -sS -o "$WORK/export.gz" -w '%{http_code}' \
+    "${WORKER_URL}/api/export?start=${RANGE_START}&end=${RANGE_END}" \
+    ${ACCESS_HEADERS[@]+"${ACCESS_HEADERS[@]}"}) || code=000
+  if [[ "$code" == "200" ]] && gzip -dc "$WORK/export.gz" >"$WORK/export.csv" 2>/dev/null; then
+    echo " done"; R2_OK=true
+  else
+    echo " FAILED (HTTP $code — Access login page or error); falling back to wrangler r2"
+  fi
+fi
+if [[ "$R2_OK" != true ]]; then
+  # Read the hour objects directly; export filters by ts, so do the same below.
+  printf "Fetching %s R2 hour object(s) via wrangler" "$(wc -l <"$WORK/hours.txt" | tr -d ' ')"
+  : >"$WORK/export.csv"; R2_OK=true; missing_objs=0
+  while IFS= read -r hp; do
+    key="raw/${hp:0:10}/${hp:11:2}.csv"
+    if out=$(cd "$WORKER_DIR" && CLOUDFLARE_API_TOKEN="$D1_API_TOKEN" npx --no-install wrangler r2 object get "${R2_BUCKET}/${key}" --file "$WORK/hour.csv" --remote 2>&1); then
+      cat "$WORK/hour.csv" >>"$WORK/export.csv"; printf "."
+    elif echo "$out" | grep -qi "not found\|does not exist\|10007"; then
+      missing_objs=$((missing_objs + 1)); printf "x"
+    else
+      echo " FAILED on $key: $(echo "$out" | grep -v '^\s*$' | tail -2 | tr '\n' ' ')"; R2_OK=false; break
+    fi
+  done <"$WORK/hours.txt"
+  [[ "$R2_OK" == true ]] && echo " done ($missing_objs object(s) absent)"
+fi
+if [[ "$R2_OK" == true ]]; then
+  jq -Rsc --arg s "$RANGE_START" --arg e "$RANGE_END" '[split("\n")[] | select(length > 0 and (startswith("tunnel_name,") | not)) | split(",")
+            | select(length >= 4) | {t: .[0], dir: .[1], ts: .[2], v: (.[3] | tonumber)} | select(.ts >= $s and .ts < $e)]' "$WORK/export.csv" >"$WORK/r2.json"
+  echo "  R2 rows in range: $(jq length "$WORK/r2.json")"
+fi
+if true; then
+  echo
+  echo "== R2 archive vs D1 per hour (rows in either store; -N in D1 but not R2, +N in R2 but not D1, ~N value differs >0.5%)"
+  jq -r --slurpfile d1f "$WORK/d1.json" --slurpfile r2f "$WORK/r2.json" --rawfile hours "$(if [[ -s "$WORK/hours.txt" ]]; then echo "$WORK/hours.txt"; else echo /dev/null; fi)" \
+     --arg rs "$RANGE_START" --arg re "$RANGE_END" -n '
+    def pad($n): tostring | (" " * $n + .)[-$n:];
+    def changed($a; $b): (($a - $b) | fabs) > ([1, ($a | fabs) * 0.005] | max);
+    def epoch: (sub("Z$"; "") | strptime("%Y-%m-%dT%H:%M:%S") | mktime);
+    def iso: strftime("%Y-%m-%dT%H:%M:%SZ");
+    ($d1f[0]) as $d1 | ($r2f[0]) as $r2
+    | if $r2 == null then "  R2 export unavailable"
+      elif $d1 == null then "  D1 unavailable: R2 has \($r2 | length) rows in range"
+      else
+        ($d1 | map({key: (.tunnel_name + "|" + .direction + "|" + .ts), value: .bit_rate}) | from_entries) as $D
+        | ($r2 | map({key: (.t + "|" + .dir + "|" + .ts), value: .v}) | from_entries) as $R
+        | ([range(($rs | epoch); ($re | epoch); 3600)] | map(iso | .[0:13])) as $H
+        | "  hour              D1 rows  R2 rows  -D1only  +R2only  ~diff",
+          ( $H[] as $h
+            | ($D | keys | map(select(.[-20:-7] == $h))) as $dk
+            | ($R | keys | map(select(.[-20:-7] == $h))) as $rk
+            | ($dk - $rk | length) as $miss | ($rk - $dk | length) as $extra
+            | ([ $dk[] | select($R[.] != null) | select(changed($R[.]; $D[.])) ] | length) as $chg
+            | "  \($h):00Z  \($dk | length | pad(7))  \($rk | length | pad(7))  \($miss | pad(7))  \($extra | pad(7))  \($chg | pad(5))" ),
+          ( ($D | keys) as $dk | ($R | keys) as $rk
+            | ($dk - $rk) as $missing
+            | "  totals: D1 \($dk | length), R2 \($rk | length), missing from R2 \($missing | length), only in R2 \($rk - $dk | length), value differs \([ $dk[] | select($R[.] != null) | select(changed($R[.]; $D[.])) ] | length)",
+              (if ($missing | length) > 0 then
+                 "  missing from R2 by hour: " + ($missing | map(.[-20:-7]) | group_by(.) | map("\(.[0]):00Z=\(length)") | join(" ")),
+                 "  sample: " + ($missing | .[0:5] | join("  "))
+               else empty end) )
+      end
+  '
+  echo
+fi
 
 [[ "$MODE" == "range" ]] && exit 0
-
-# ── R2 via /api/export (one call per reported tunnel window) ────────────────
-r2_export() {
-  local tunnel="$1" start="$2" end="$3"
-  local code
-  code=$(curl -sS -o "$WORK/export.gz" -w '%{http_code}' \
-    "${WORKER_URL}/api/export?start=${start}&end=${end}&tunnel=$(jq -rn --arg t "$tunnel" '$t|@uri')" \
-    ${ACCESS_HEADERS[@]+"${ACCESS_HEADERS[@]}"}) || { echo null; return; }
-  if [[ "$code" != "200" ]] || ! gzip -dc "$WORK/export.gz" >"$WORK/export.csv" 2>/dev/null; then
-    echo "  R2 export for $tunnel: HTTP $code (Access login page or error)" >&2
-    echo null; return
-  fi
-  jq -Rsc '[split("\n")[] | select(length > 0 and (startswith("tunnel_name,") | not)) | split(",")
-            | select(length >= 4) | {dir: .[1], ts: .[2], v: (.[3] | tonumber)}]' "$WORK/export.csv"
-}
 
 echo "== Per reported gap: bucket × source (. = no row; > = inside the reported gap).  D1 shows value@+minutes after bucket"
 : >"$WORK/summary.jsonl"
 while IFS=$'\t' read -r idx tunnel dir ws we last_seen gap_min; do
   echo
   echo "-- [$idx] $tunnel $dir   reported last seen $last_seen, gap ${gap_min}m   window $ws -> $we"
-  R2_ROWS=null
-  [[ -n "${WORKER_URL:-}" ]] && R2_ROWS=$(r2_export "$tunnel" "$ws" "$we")
-  jq -r --slurpfile gqlf "$WORK/gql.json" --slurpfile d1f "$WORK/d1.json" --slurpfile gapsf "$WORK/gaps_d1.json" \
+  jq -r --slurpfile gqlf "$WORK/gql.json" --slurpfile d1f "$WORK/d1.json" --slurpfile gapsf "$WORK/gaps_d1.json" --slurpfile r2f "$WORK/r2.json" \
      --arg s "$ws" --arg e "$we" --arg dir "$dir" --arg ls "$last_seen" --argjson gap "$gap_min" \
-     --argjson r2 "$R2_ROWS" --arg idx "$idx" --arg tunnel "$tunnel" -n '
+     --arg idx "$idx" --arg tunnel "$tunnel" -n '
     ($gqlf[0]) as $gql | ($d1f[0]) as $d1 | ($gapsf[0]) as $gaps
+    | (if $r2f[0] == null then null else ($r2f[0] | map(select(.t == $tunnel))) end) as $r2
     | '"$JQ_PRELUDE"'
     def fmt: if . == null then "." else (. | round | tostring) end;
     ($s | epoch) as $se | ($e | epoch) as $ee
