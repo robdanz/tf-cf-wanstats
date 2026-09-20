@@ -205,7 +205,7 @@ d1_query() {
     echo "  D1 query failed: $(echo "$out" | grep -v '^\s*$' | tail -2 | tr '\n' ' ')" >&2
     echo null; return
   fi
-  echo "$out" | jq -c '.[0].results' 2>/dev/null || { echo "  D1: unparseable wrangler output" >&2; echo null; }
+  echo "$out" | jq -c '.[0].results' 2>/dev/null || { echo "  D1: unparseable wrangler output: $(echo "$out" | tr '\n' ' ' | cut -c1-300)" >&2; echo null; }
 }
 
 D1_OK=false
@@ -264,7 +264,7 @@ jq -r --slurpfile gqlf "$WORK/gql.json" --slurpfile d1f "$WORK/d1.json" --slurpf
           . as $dir | ($G[$dir + "|" + $ts] // {}) as $g | (if $D == null then null else ($D[$dir + "|" + $ts] // {}) end) as $d
           | if $d == null then "  -   \($g | length | pad(4))      -     -     -"
             else ($g | keys) as $gk | ($d | keys) as $dk
-              | ($gk - $dk | length) as $add | ($dk - $gk | length) as $rem
+              | ($gk | map(select($d[.] == null)) | length) as $add | ($dk | map(select($g[.] == null)) | length) as $rem
               | ([ $gk[] | select($d[.] != null) | select(changed($g[.]; $d[.].v)) ] | length) as $chg
               | "\($d | length | pad(4)) \($g | length | pad(4))   \($add | pad(4))  \($rem | pad(4))  \($chg | pad(4))"
             end)
@@ -273,7 +273,7 @@ jq -r --slurpfile gqlf "$WORK/gql.json" --slurpfile d1f "$WORK/d1.json" --slurpf
       ( [ $B[] as $ts | ["ingress","egress"][] as $dir
           | ($G[$dir + "|" + $ts] // {}) as $g | ($D[$dir + "|" + $ts] // {}) as $d
           | ($g | keys) as $gk | ($d | keys) as $dk
-          | { d1: ($dk | length), gql: ($gk | length), add: ($gk - $dk | length), rem: ($dk - $gk | length),
+          | { d1: ($dk | length), gql: ($gk | length), add: ($gk | map(select($d[.] == null)) | length), rem: ($dk | map(select($g[.] == null)) | length),
               chg: ([ $gk[] | select($d[.] != null) | select(changed($g[.]; $d[.].v)) ] | length),
               gbits: ([ $g[] ] | add // 0), dbits: ([ $d[] | .v ] | add // 0) } ]
         | { d1: (map(.d1) | add), gql: (map(.gql) | add), add: (map(.add) | add), rem: (map(.rem) | add), chg: (map(.chg) | add),
@@ -342,20 +342,20 @@ if true; then
         ($d1 | map({key: (.tunnel_name + "|" + .direction + "|" + .ts), value: .bit_rate}) | from_entries) as $D
         | ($r2 | map({key: (.t + "|" + .dir + "|" + .ts), value: .v}) | from_entries) as $R
         | ([range(($rs | epoch); ($re | epoch); 3600)] | map(iso | .[0:13])) as $H
+        # One linear pass per store with object lookups: array subtraction in
+        # jq is a linear search per element and never finishes at 200k rows.
+        | ($D | keys_unsorted | map(select($R[.] == null))) as $missing
+        | ($R | keys_unsorted | map(select($D[.] == null))) as $extra
+        | ($D | keys_unsorted | map(select($R[.] != null and changed($R[.]; $D[.])))) as $diffs
+        | def byhour: reduce .[] as $k ({}; .[$k[-20:-7]] += 1);
+          ($D | keys_unsorted | byhour) as $dn | ($R | keys_unsorted | byhour) as $rn
+        | ($missing | byhour) as $mn | ($extra | byhour) as $en | ($diffs | byhour) as $cn
         | "  hour              D1 rows  R2 rows  -D1only  +R2only  ~diff",
           ( $H[] as $h
-            | ($D | keys | map(select(.[-20:-7] == $h))) as $dk
-            | ($R | keys | map(select(.[-20:-7] == $h))) as $rk
-            | ($dk - $rk | length) as $miss | ($rk - $dk | length) as $extra
-            | ([ $dk[] | select($R[.] != null) | select(changed($R[.]; $D[.])) ] | length) as $chg
-            | "  \($h):00Z  \($dk | length | pad(7))  \($rk | length | pad(7))  \($miss | pad(7))  \($extra | pad(7))  \($chg | pad(5))" ),
-          ( ($D | keys) as $dk | ($R | keys) as $rk
-            | ($dk - $rk) as $missing
-            | "  totals: D1 \($dk | length), R2 \($rk | length), missing from R2 \($missing | length), only in R2 \($rk - $dk | length), value differs \([ $dk[] | select($R[.] != null) | select(changed($R[.]; $D[.])) ] | length)",
-              (if ($missing | length) > 0 then
-                 "  missing from R2 by hour: " + ($missing | map(.[-20:-7]) | group_by(.) | map("\(.[0]):00Z=\(length)") | join(" ")),
-                 "  sample: " + ($missing | .[0:5] | join("  "))
-               else empty end) )
+            | "  \($h):00Z  \($dn[$h] // 0 | pad(7))  \($rn[$h] // 0 | pad(7))  \($mn[$h] // 0 | pad(7))  \($en[$h] // 0 | pad(7))  \($cn[$h] // 0 | pad(5))" ),
+          "  totals: D1 \($D | length), R2 \($R | length), missing from R2 \($missing | length), only in R2 \($extra | length), value differs \($diffs | length)",
+          (if ($missing | length) > 0 then "  sample missing: " + ($missing | sort | .[0:5] | join("  ")) else empty end),
+          (if ($extra | length) > 0 then "  sample R2-only: " + ($extra | sort | .[0:5] | join("  ")) else empty end)
       end
   '
   echo
