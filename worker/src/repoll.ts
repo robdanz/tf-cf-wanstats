@@ -6,10 +6,13 @@ import { snapToHour, snapToDay } from './utils';
 import { hourKey } from './reconcile';
 
 // The late re-poll. Cloudflare rewrites magicTransitNetworkAnalyticsAdaptiveGroups
-// well after the fact: measured on the lab tenant (2026-09-20), a 5-minute
-// bucket is served unchanged for its first ~8-10 hours and then, once,
-// gains rows for low-rate tunnels, loses a few, and has about a third of its
-// values shift by more than 0.5%. The collector's last look is 65 minutes
+// well after the fact: measured on the lab tenant (2026-09-20), buckets are
+// rewritten in a periodic batch — the rewrite boundary sat at 06:00Z from
+// 16:20Z through 23:30Z that day, hours before it changed (25-40 rows per
+// hour on a 7-tunnel account), hours after it untouched at 14h of age — and
+// are stable afterwards (no further change over the following days). A
+// rewrite gains rows for low-rate tunnels, loses a few, and shifts about a
+// third of the values by more than 0.5%. The collector's last look is 65 minutes
 // after a bucket, so none of that ever reached D1 or R2 (the customer's
 // 2026-09-13 report: 4 of ~250 missing buckets were at Cloudflare, never in
 // our stores). This pass re-fetches every hour once per delay in
@@ -17,8 +20,9 @@ import { hourKey } from './reconcile';
 // changed rows get a new written_at, so /api/current?since= consumers see
 // the corrections), merge-by-key into the hour's R2 object, and the hourly
 // and daily rollups are rewritten; rows the source no longer returns for a
-// bucket it did answer for are removed from both stores. Two delays: 14h catches the age-based
-// rewrite, 38h is insurance in case it is a fixed-time daily job.
+// bucket it did answer for are removed from both stores. Two delays: 38h is
+// the one that matters (every hour is past the daily batch by then); 14h
+// picks up the hours the batch has already covered a day earlier.
 //
 // Each delay keeps its own watermark in cron_metadata
 // (`repolled_<delay>h_through`), walked like the hour ledger: an hour is
