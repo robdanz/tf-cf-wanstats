@@ -37,6 +37,9 @@
 # Blank lines and lines starting with # are ignored. Times are taken as UTC;
 # set TZ_OFFSET_MIN if the consumer reported local time (e.g. -120 for UTC+2).
 # pad-minutes (default 30) widens each window on both sides.
+# By default the timestamp is the last row BEFORE the gap. Set GAP_BEFORE=1
+# when the timestamp is the first row AFTER the gap (the gap ended there),
+# which is how the customer's export reads: "resumed at T after N minutes".
 #
 # Required environment variables:
 #   CLOUDFLARE_API_TOKEN  Account Analytics: Read (the worker's WAN_API_TOKEN)
@@ -86,6 +89,7 @@ R2_VIA="${R2_VIA:-export}"
 R2_BUCKET="${R2_BUCKET:-tf-cf-wanstats-raw-metrics}"
 PROBE_SLEEP="${PROBE_SLEEP:-0.5}"
 TZ_OFFSET_MIN="${TZ_OFFSET_MIN:-0}"
+GAP_BEFORE="${GAP_BEFORE:-0}"
 MAX_BUCKETS=288
 
 ACCESS_HEADERS=()
@@ -135,8 +139,13 @@ else
       echo "skip: cannot parse '$line'" >&2; continue
     fi
     ls_epoch=$(( $(to_epoch "$last_seen") - TZ_OFFSET_MIN * 60 ))
-    ws=$(floor5 $(( ls_epoch - PAD_MIN * 60 )))
-    we=$(ceil5  $(( ls_epoch + gap_min * 60 + PAD_MIN * 60 + 300 )))
+    if [[ "$GAP_BEFORE" == "1" ]]; then
+      ws=$(floor5 $(( ls_epoch - gap_min * 60 - PAD_MIN * 60 )))
+      we=$(ceil5  $(( ls_epoch + PAD_MIN * 60 + 300 )))
+    else
+      ws=$(floor5 $(( ls_epoch - PAD_MIN * 60 )))
+      we=$(ceil5  $(( ls_epoch + gap_min * 60 + PAD_MIN * 60 + 300 )))
+    fi
     n=$((n + 1))
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$n" "$f1" "$f2" "$(to_iso "$ws")" "$(to_iso "$we")" "$(to_iso "$ls_epoch")" "$gap_min" >>"$WORK/gaps.tsv"
     cur=$ws; while (( cur < we )); do to_iso "$cur"; cur=$((cur + 300)); done >>"$WORK/buckets.raw"
@@ -153,7 +162,7 @@ RANGE_START=$(head -1 "$WORK/buckets.txt")
 RANGE_END=$(to_iso $(( $(to_epoch "$(tail -1 "$WORK/buckets.txt")") + 300 )))
 
 echo "gap-probe ($MODE): $BUCKET_COUNT bucket(s) $RANGE_START -> $RANGE_END   account: $ACCOUNT_ID"
-[[ "$MODE" == "gaps" ]] && echo "  $(wc -l <"$WORK/gaps.tsv" | tr -d ' ') reported gap(s), pad ${PAD_MIN}m, tz offset ${TZ_OFFSET_MIN}m"
+[[ "$MODE" == "gaps" ]] && echo "  $(wc -l <"$WORK/gaps.tsv" | tr -d ' ') reported gap(s), pad ${PAD_MIN}m, tz offset ${TZ_OFFSET_MIN}m, timestamp = $([[ "$GAP_BEFORE" == "1" ]] && echo "first row after the gap" || echo "last row before the gap")"
 echo "  now: $(to_iso "$(date +%s)")"
 echo
 
@@ -367,16 +376,18 @@ echo "== Per reported gap: bucket × source (. = no row; > = inside the reported
 : >"$WORK/summary.jsonl"
 while IFS=$'\t' read -r idx tunnel dir ws we last_seen gap_min; do
   echo
-  echo "-- [$idx] $tunnel $dir   reported last seen $last_seen, gap ${gap_min}m   window $ws -> $we"
+  echo "-- [$idx] $tunnel $dir   reported $([[ "$GAP_BEFORE" == "1" ]] && echo "resumed at" || echo "last seen") $last_seen, gap ${gap_min}m   window $ws -> $we"
   jq -r --slurpfile gqlf "$WORK/gql.json" --slurpfile d1f "$WORK/d1.json" --slurpfile gapsf "$WORK/gaps_d1.json" --slurpfile r2f "$WORK/r2.json" \
      --arg s "$ws" --arg e "$we" --arg dir "$dir" --arg ls "$last_seen" --argjson gap "$gap_min" \
-     --arg idx "$idx" --arg tunnel "$tunnel" -n '
+     --arg idx "$idx" --arg tunnel "$tunnel" --argjson before "$GAP_BEFORE" -n '
     ($gqlf[0]) as $gql | ($d1f[0]) as $d1 | ($gapsf[0]) as $gaps
     | (if $r2f[0] == null then null else ($r2f[0] | map(select(.t == $tunnel))) end) as $r2
     | '"$JQ_PRELUDE"'
     def fmt: if . == null then "." else (. | round | tostring) end;
     ($s | epoch) as $se | ($e | epoch) as $ee
-    | ($ls | epoch) as $lse | ($lse + 300) as $miss_start | ($lse + $gap * 60) as $miss_end
+    | ($ls | epoch) as $lse
+    | (if $before == 1 then $lse - $gap * 60 else $lse + 300 end) as $miss_start
+    | (if $before == 1 then $lse else $lse + $gap * 60 end) as $miss_end
     | (if $r2 == null then null else ($r2 | map(select(.dir == $dir)) | map({key: .ts, value: .v}) | from_entries) end) as $R
     | "  bucket                  GQL now   D1 (arrived)       R2        class",
       ( [range($se; $ee; 300)] | map(
