@@ -348,7 +348,16 @@ jq -r --slurpfile gqlf "$WORK/gql.json" --slurpfile d1f "$WORK/d1.json" --slurpf
         | { d1: (map(.d1) | add), gql: (map(.gql) | add), add: (map(.add) | add), rem: (map(.rem) | add), chg: (map(.chg) | add),
             gbits: (map(.gbits) | add), dbits: (map(.dbits) | add) }
         | "  totals: \($lbl) rows \(.d1), source rows now \(.gql): +\(.add) only at source, -\(.rem) only in \($lbl), ~\(.chg) values changed"
-          + (if .dbits > 0 then "; sum of bit rates now vs stored: \(((.gbits / .dbits - 1) * 10000 | round) / 100)%" else "" end) )
+          + (if .dbits > 0 then "; sum of bit rates now vs stored: \(((.gbits / .dbits - 1) * 10000 | round) / 100)%" else "" end) ),
+      # Per-hour subtotals: an hour at or before a re-poll watermark should be
+      # all zeros; an hour after it may differ until its pass runs.
+      "  per hour (+at source only / -in \($lbl) only / ~changed):",
+      ( [ $B[] as $ts | ["ingress","egress"][] as $dir
+          | ($G[$dir + "|" + $ts] // {}) as $g | ($D[$dir + "|" + $ts] // {}) as $d
+          | ($g | keys) as $gk | ($d | keys) as $dk
+          | { h: ($ts | .[0:13]), add: ($gk | map(select($d[.] == null)) | length), rem: ($dk | map(select($g[.] == null)) | length),
+              chg: ([ $gk[] | select($d[.] != null) | select(changed($g[.]; $d[.].v)) ] | length) } ]
+        | group_by(.h) | .[] | "    \(.[0].h):00Z  +\(map(.add) | add)  -\(map(.rem) | add)  ~\(map(.chg) | add)" )
      else empty end)
 ' >"$WORK/pop.txt" 2>"$WORK/pop.err" || { echo "  population table failed:"; cat "$WORK/pop.err"; }
 cat "$WORK/pop.txt"
