@@ -2,6 +2,38 @@ import type { NormalizedRow, TunnelStat, GapBucket, TrackedGapBucket, CronStep }
 
 const BATCH_SIZE = 100;
 
+// D1 occasionally fails a statement with a storage-layer reset ("Internal
+// error in D1 DB storage caused object to be reset") or a transient
+// overload. One such failure used to fail the whole collect step (recorded
+// 2026-09-18 on the customer); the overlapping windows healed it, but the
+// write itself was cheap to retry. Retry only errors that look transient;
+// anything else (constraint, SQL, missing table) surfaces immediately.
+const D1_RETRY_DELAYS_MS = [500, 1500, 3000];
+const D1_TRANSIENT = /internal error|object to be reset|storage caused|overloaded|network connection lost|reset|D1_ERROR: (?!no such|NOT NULL|UNIQUE|SQLITE_CONSTRAINT|near )/i;
+
+export function isTransientD1Error(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return D1_TRANSIENT.test(msg);
+}
+
+export async function withD1Retry<T>(op: () => Promise<T>, label = 'D1 write', sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms))): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await op();
+    } catch (err) {
+      if (attempt >= D1_RETRY_DELAYS_MS.length || !isTransientD1Error(err)) throw err;
+      const delay = D1_RETRY_DELAYS_MS[attempt];
+      console.warn(`${label}: transient D1 error, retry ${attempt + 1}/${D1_RETRY_DELAYS_MS.length} in ${delay}ms: ${err instanceof Error ? err.message : String(err)}`);
+      await sleep(delay);
+    }
+  }
+}
+
+// Every batched write goes through the retry wrapper.
+function batch(db: D1Database, statements: D1PreparedStatement[], label: string): Promise<D1Result[]> {
+  return withD1Retry(() => db.batch(statements), label);
+}
+
 // Conditional upsert: written_at moves only when the row is new or its value
 // changed. Light runs re-fetch the same buckets every 5 minutes; with plain
 // INSERT OR REPLACE every one of those would look "changed" to
@@ -24,7 +56,7 @@ export async function storeTunnelMetrics(
   for (let i = 0; i < rows.length; i += BATCH_SIZE) {
     const chunk = rows.slice(i, i + BATCH_SIZE);
     const stamp = writtenAt ?? new Date().toISOString();
-    await db.batch(
+    await batch(db, 
       chunk.map((row) =>
         db.prepare(`
           INSERT INTO tunnel_metrics (tunnel_name, direction, ts, bit_rate, written_at)
@@ -33,8 +65,7 @@ export async function storeTunnelMetrics(
             SET bit_rate = excluded.bit_rate, written_at = excluded.written_at
             WHERE bit_rate IS NOT excluded.bit_rate
         `).bind(row.tunnelName, direction, row.ts, row.bitRate, stamp),
-      ),
-    );
+      ), 'storeTunnelMetrics');
   }
 }
 
@@ -59,9 +90,9 @@ export async function pruneRawRows(
     }
   }
   for (let i = 0; i < toDelete.length; i += BATCH_SIZE) {
-    await db.batch(toDelete.slice(i, i + BATCH_SIZE).map((d) =>
+    await batch(db, toDelete.slice(i, i + BATCH_SIZE).map((d) =>
       db.prepare('DELETE FROM tunnel_metrics WHERE tunnel_name = ? AND direction = ? AND ts = ?').bind(d.tunnelName, d.direction, d.ts),
-    ));
+    ), 'pruneRawRows');
   }
   return toDelete.length;
 }
@@ -148,14 +179,14 @@ export async function rollupHourFromRows(
 
   const entries = Array.from(aggs.entries());
   for (let i = 0; i < entries.length; i += BATCH_SIZE) {
-    await db.batch(entries.slice(i, i + BATCH_SIZE).map(([key, a]) => {
+    await batch(db, entries.slice(i, i + BATCH_SIZE).map(([key, a]) => {
       const [tunnelName, direction] = key.split('\u0000');
       return db.prepare(`
         INSERT OR REPLACE INTO tunnel_metrics_hourly
           (tunnel_name, direction, ts, avg_bit_rate, max_bit_rate, min_bit_rate, sample_count)
         VALUES (?, ?, ?, ?, ?, ?, ?)
       `).bind(tunnelName, direction, hourStart, a.sum / a.n, a.max, a.min, a.n);
-    }));
+    }), 'rollupHourFromRows');
   }
   return entries.length;
 }
@@ -302,12 +333,11 @@ export async function insertGapBuckets(db: D1Database, buckets: GapBucket[], now
   if (buckets.length === 0) return;
   for (let i = 0; i < buckets.length; i += BATCH_SIZE) {
     const chunk = buckets.slice(i, i + BATCH_SIZE);
-    await db.batch(
+    await batch(db, 
       chunk.map((b) =>
         db.prepare('INSERT OR IGNORE INTO gap_buckets (ts, attempts, first_detected) VALUES (?, 0, ?)')
           .bind(b.ts, now),
-      ),
-    );
+      ), 'insertGapBuckets');
   }
 }
 
@@ -347,7 +377,7 @@ export async function deleteResolvedGapBuckets(db: D1Database, buckets: GapBucke
   if (buckets.length === 0) return;
   for (let i = 0; i < buckets.length; i += BATCH_SIZE) {
     const chunk = buckets.slice(i, i + BATCH_SIZE);
-    await db.batch(chunk.map((b) => db.prepare('DELETE FROM gap_buckets WHERE ts = ?').bind(b.ts)));
+    await batch(db, chunk.map((b) => db.prepare('DELETE FROM gap_buckets WHERE ts = ?').bind(b.ts)), 'deleteResolvedGapBuckets');
   }
 }
 
@@ -355,7 +385,7 @@ export async function incrementOrConfirmGapBuckets(db: D1Database, buckets: GapB
   if (buckets.length === 0) return;
   for (let i = 0; i < buckets.length; i += BATCH_SIZE) {
     const chunk = buckets.slice(i, i + BATCH_SIZE);
-    await db.batch(
+    await batch(db, 
       chunk.map((b) =>
         db.prepare(`
           UPDATE gap_buckets
@@ -363,8 +393,7 @@ export async function incrementOrConfirmGapBuckets(db: D1Database, buckets: GapB
               confirmed_empty_at = CASE WHEN attempts + 1 >= ? THEN ? ELSE NULL END
           WHERE ts = ? AND confirmed_empty_at IS NULL
         `).bind(MAX_GAP_ATTEMPTS, now, b.ts),
-      ),
-    );
+      ), 'incrementOrConfirmGapBuckets');
   }
 }
 
@@ -732,7 +761,7 @@ export async function recordCronError(db: D1Database, step: CronStep, err: unkno
   const upsert = 'INSERT OR REPLACE INTO cron_metadata (key, value) VALUES (?, ?)';
   try {
     const at = new Date().toISOString();
-    await db.batch([
+    await batch(db, [
       // Most recent error overall (existing consumers) …
       db.prepare(upsert).bind('last_error_at', at),
       db.prepare(upsert).bind('last_error_step', step),
@@ -740,7 +769,7 @@ export async function recordCronError(db: D1Database, step: CronStep, err: unkno
       // … and per step, so an hourly failure cannot mask a daily one.
       db.prepare(upsert).bind(`last_error_${step}_at`, at),
       db.prepare(upsert).bind(`last_error_${step}_message`, message),
-    ]);
+    ], 'recordCronError');
   } catch (writeErr) {
     const writeMessage = writeErr instanceof Error ? writeErr.message : String(writeErr);
     console.error(`Failed to record cron error for step ${step}: ${writeMessage}`);
