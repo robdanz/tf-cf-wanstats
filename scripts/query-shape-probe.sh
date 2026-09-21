@@ -43,7 +43,7 @@ echo "slice $START -> $E   account $ACCOUNT_ID   now $(to_iso "$(date +%s)")"
 jq -rn --argjson A "$A" --argjson B "$B" --argjson C "$C" '
   def n: .rows | length;
   def sum: [.rows[] | split("|")[2] | tonumber] | add // 0;
-  [$A,$B,$C][] | "  \(.label): rows=\(n)  sum_bps=\(sum | floor)  errors=\(.errors | join("; "))",
+  ([$A,$B,$C][] | "  \(.label): rows=\(n)  sum_bps=\(sum | floor)  errors=\(.errors | join("; "))"),
   "",
   (if ($A.rows == $B.rows and $B.rows == $C.rows) then "  ALL SAME: the worker'"'"'s request is served the same data as any other wording"
    else
