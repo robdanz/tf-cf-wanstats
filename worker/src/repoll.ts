@@ -20,9 +20,14 @@ import { hourKey } from './reconcile';
 // changed rows get a new written_at, so /api/current?since= consumers see
 // the corrections), merge-by-key into the hour's R2 object, and the hourly
 // and daily rollups are rewritten; rows the source no longer returns for a
-// bucket it did answer for are removed from both stores. Two delays: 38h is
-// the one that matters (every hour is past the daily batch by then); 14h
-// picks up the hours the batch has already covered a day earlier.
+// bucket it did answer for are removed from both stores. Three delays: 14h
+// picks up the hours the batch has already covered a day earlier; 38h is
+// past the daily batch for every hour; 62h exists because the rewrite
+// reaches the API's serving replicas hours apart — on 2026-09-21 the
+// customer's 38h pass at 15:01Z still fetched pre-rewrite data for an hour
+// that a client elsewhere had seen rewritten at 13:00Z, and the worker only
+// saw it by 18:54Z. A pass that finds nothing changed is indistinguishable
+// from "not rewritten yet", so a later bounded pass is the safety net.
 //
 // Each delay keeps its own watermark in cron_metadata
 // (`repolled_<delay>h_through`), walked like the hour ledger: an hour is
@@ -31,7 +36,7 @@ import { hourKey } from './reconcile';
 // fetched. A failed slice stops the pass; the next full run retries the
 // same hour. A bucket the source answers with no rows at all is left as is.
 
-export const REPOLL_DELAYS_H = [14, 38];
+export const REPOLL_DELAYS_H = [14, 38, 62];
 export const MAX_REPOLL_HOURS_PER_PASS = 3;
 // First run of a pass starts this far behind the newest due hour, so the
 // hours collected before the re-poll existed (up to a day) are covered

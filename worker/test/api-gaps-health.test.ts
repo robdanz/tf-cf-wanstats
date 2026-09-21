@@ -75,7 +75,7 @@ describe('/api/health', () => {
     expect(body.hours_behind).toBeNull();
     expect(body.last_error).toBeNull();
     expect(body.step_errors).toEqual({ collect: null, retry: null, reconcile: null, repoll: null, billing: null, purge_d1: null, purge_r2: null });
-    expect(body.repoll).toEqual({ '14h': { through: null, hours_behind: null }, '38h': { through: null, hours_behind: null } });
+    expect(body.repoll).toEqual({ '14h': { through: null, hours_behind: null }, '38h': { through: null, hours_behind: null }, '62h': { through: null, hours_behind: null } });
   });
 
   it('reflects metadata keys, computes hours_behind, counts buckets, and exposes per-step errors', async () => {

@@ -65,8 +65,10 @@ describe('repollHours', () => {
     const results = await repollHours(TEST_ENV, now);
 
     // 38h pass: watermark 09-19 01:00 - 26h = 09-17 23:00; processes 00:00, 01:00, 02:00 on 09-18; 23 hours still behind.
+    // 62h pass: newest 09-18 01:00, minus 26h = 09-16 23:00; processes 00:00..02:00 on 09-17.
     expect(results.map((r) => [r.delayH, r.processed, r.hoursBehind, r.through]))
-      .toEqual([[14, 1, 0, h14], [38, MAX_REPOLL_HOURS_PER_PASS, INITIAL_CATCHUP_H - MAX_REPOLL_HOURS_PER_PASS, '2026-09-18T02:00:00Z']]);
+      .toEqual([[14, 1, 0, h14], [38, MAX_REPOLL_HOURS_PER_PASS, INITIAL_CATCHUP_H - MAX_REPOLL_HOURS_PER_PASS, '2026-09-18T02:00:00Z'],
+                [62, MAX_REPOLL_HOURS_PER_PASS, INITIAL_CATCHUP_H - MAX_REPOLL_HOURS_PER_PASS, '2026-09-17T02:00:00Z']]);
     expect(await getMetadata(DB, repollKey(14))).toBe(h14);
     expect(await getMetadata(DB, repollKey(38))).toBe('2026-09-18T02:00:00Z');
     void h38;

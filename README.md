@@ -13,8 +13,9 @@ Cron (*/5 * * * *)
   every 5 min (light): 20-min window → D1; retry pending gap buckets
   every hour  (full):  65-min window → D1 + R2; hour ledger (gap discovery,
                        hourly/daily rollups, R2 rebuild from D1); late re-poll
-                       of one hour per pass at +14h and +38h (Cloudflare rewrites
-                       buckets ~10-12h after the fact) → D1 + R2 + rollups
+                       of one hour per pass at +14h, +38h and +62h (Cloudflare rewrites
+                       buckets in a daily batch that reaches API replicas hours apart)
+                       → D1 + R2 + rollups
   midnight UTC:        billing p95 → D1 retention (chunked) → R2 retention,
                        each step isolated and reported in /api/health
   └─▶ Cloudflare GraphQL API (magicTransitNetworkAnalyticsAdaptiveGroups)
