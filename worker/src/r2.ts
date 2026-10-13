@@ -139,6 +139,23 @@ export async function writeRawToR2(
   return { filesWritten: hourBuckets.size, totalRows };
 }
 
+// The rows of one hour object (`hourStart` hour-aligned), one per key.
+export async function readRawHour(bucket: R2Bucket, hourStart: Date): Promise<{ ingress: NormalizedRow[]; egress: NormalizedRow[] }> {
+  const iso = hourStart.toISOString();
+  const obj = await bucket.get(`raw/${iso.slice(0, 10)}/${iso.slice(11, 13)}.csv`);
+  const ingress: NormalizedRow[] = [];
+  const egress: NormalizedRow[] = [];
+  if (obj === null) return { ingress, egress };
+  for (const line of collapseMaxPerKey(await obj.text()).lines.values()) {
+    const r = parseCsvLine(line);
+    if (r === null) continue;
+    const row = { tunnelName: r.tunnelName, ts: r.ts, bitRate: r.bitRate };
+    if (r.direction === 'ingress') ingress.push(row);
+    else if (r.direction === 'egress') egress.push(row);
+  }
+  return { ingress, egress };
+}
+
 export async function listRawKeys(
   bucket: R2Bucket,
   startDate: Date,

@@ -54,13 +54,17 @@ describe('reconcileHours', () => {
 
     const hourly = await DB.prepare('SELECT sample_count FROM tunnel_metrics_hourly WHERE tunnel_name = ? AND direction = ? AND ts = ?')
       .bind('LEDGER_A', 'ingress', '2026-09-01T10:00:00.000Z').first<{ sample_count: number }>();
-    expect(hourly?.sample_count).toBe(11);
+    // The hole is still tracked as a gap bucket, but the tunnel (seen this
+    // hour) gets a FILL_BIT_RATE value in it: 11 real + 1 fill per direction.
+    expect(hourly?.sample_count).toBe(12);
 
     const obj = await BUCKET.get('raw/2026-09-01/10.csv');
     const lines = (await obj!.text()).trim().split('\n');
     expect(lines[0]).toBe('tunnel_name,direction,ts,bit_rate');
-    expect(lines.filter((l) => l.startsWith('LEDGER_A,ingress,'))).toHaveLength(11);
-    expect(lines.filter((l) => l.startsWith('LEDGER_A,egress,'))).toHaveLength(11);
+    expect(lines.filter((l) => l.startsWith('LEDGER_A,ingress,'))).toHaveLength(12);
+    expect(lines.filter((l) => l.startsWith('LEDGER_A,egress,'))).toHaveLength(12);
+    expect(lines).toContain(`LEDGER_A,ingress,${holeA},1025`);
+    expect(lines).toContain(`LEDGER_A,egress,${holeA},1025`);
 
     await deleteResolvedGapBuckets(DB, [{ ts: holeA }]);
   });

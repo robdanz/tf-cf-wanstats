@@ -8,9 +8,6 @@ import {
   getP95AggregateSql,
   getBillingP95Summary,
   getBillingP95Tunnels,
-  storeTunnelMetrics,
-  pruneRawRows,
-  keepKeys,
   rollupHour,
   rollupHourFromRows,
   rollupDay,
@@ -23,10 +20,10 @@ import {
   CHANGED_SINCE_GROUP_SQL,
 } from './d1';
 import { fetchMetricsTimeSliced } from './graphql';
-import { writeRawToR2, bucketsWithRows, streamCsvExport, cleanupRawDay } from './r2';
+import { streamCsvExport, cleanupRawDay } from './r2';
 import { toPeriod, snapToHour, snapToDay } from './utils';
 import { REPOLL_DELAYS_H, repollKey, newestEligibleHour } from './repoll';
-import { withAbsentRowFills } from './fill';
+import { storeRefetch } from './fill';
 
 const VALID_SORT_COLUMNS: Record<string, string> = {
   'name': 'tunnel_name',
@@ -536,18 +533,12 @@ async function handleBackfill(request: Request, env: Env): Promise<Response> {
   const archiveOnly = new Date(end).getTime() <= rawCutoff;
 
   // Replace, not merge, for every bucket the source answered for: R2 (and
-  // D1 within retention) end up exactly equal to the source for the window.
-  // Tunnel/directions live in an hour but absent from an answered bucket get
-  // a FILL_BIT_RATE row, as in the re-poll (fill.ts).
-  const replace = bucketsWithRows(fetchedIngress, fetchedEgress);
-  const { ingress, egress, filled } = withAbsentRowFills(fetchedIngress, fetchedEgress);
-  await Promise.all([
-    archiveOnly ? Promise.resolve() : Promise.all([
-      storeTunnelMetrics(env.DB, ingress, 'ingress'),
-      storeTunnelMetrics(env.DB, egress, 'egress'),
-    ]).then(() => pruneRawRows(env.DB, replace, keepKeys(ingress, egress))),
-    writeRawToR2(env.RAW_METRICS, ingress, egress, replace),
-  ]);
+  // D1 within retention) end up exactly equal to the source for the window,
+  // plus a FILL_BIT_RATE row for every other roster tunnel/direction and
+  // bucket (fill.ts).
+  const { filled, rows } = await storeRefetch(
+    env, new Date(start), new Date(end), { ingress: fetchedIngress, egress: fetchedEgress }, archiveOnly,
+  );
 
   // The raw rows just changed; the rollups derived from them must follow or
   // the 7d/30d/90d views keep showing the pre-backfill values. Hours in the
@@ -563,7 +554,7 @@ async function handleBackfill(request: Request, env: Env): Promise<Response> {
       const hourRaw = new Date(h).toISOString().replace('.000Z', 'Z');
       const hourEnd = new Date(h + 60 * 60 * 1000).toISOString().replace('.000Z', 'Z');
       const inHour = (r: { ts: string }) => r.ts >= hourRaw && r.ts < hourEnd;
-      await rollupHourFromRows(env.DB, hour, ingress.filter(inHour), egress.filter(inHour));
+      await rollupHourFromRows(env.DB, hour, rows.ingress.filter(inHour), rows.egress.filter(inHour));
     } else {
       await rollupHour(env.DB, hour);
     }

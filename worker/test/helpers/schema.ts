@@ -1,7 +1,7 @@
 // The vitest D1 binding starts empty — no migrations are auto-applied.
 // Each test file that touches D1 calls this once (in beforeAll) to create
 // the tables it needs, matching migrations/0001_initial.sql, 0002_rollups.sql,
-// 0004_written_at.sql, and 0005_gap_buckets.sql (0003's gap_tracking is dropped by 0005). D1Database.exec() takes one
+// 0004_written_at.sql, 0005_gap_buckets.sql and 0006_tunnel_seen_days.sql (seed omitted) (0003's gap_tracking is dropped by 0005). D1Database.exec() takes one
 // statement at a time (embedded newlines can be misread as statement separators),
 // so each entry here must be a single logical line.
 const STATEMENTS = [
@@ -17,6 +17,8 @@ const STATEMENTS = [
   `CREATE INDEX IF NOT EXISTS idx_tmd_tunnel_direction_ts ON tunnel_metrics_daily (tunnel_name, direction, ts)`,
   `CREATE TABLE IF NOT EXISTS gap_buckets ( ts TEXT PRIMARY KEY, attempts INTEGER NOT NULL DEFAULT 0, first_detected TEXT NOT NULL, confirmed_empty_at TEXT )`,
   `CREATE INDEX IF NOT EXISTS idx_gap_buckets_pending ON gap_buckets (confirmed_empty_at, attempts, first_detected)`,
+  `CREATE TABLE IF NOT EXISTS tunnel_seen_days ( tunnel_name TEXT NOT NULL, day TEXT NOT NULL, first_ts TEXT NOT NULL, PRIMARY KEY (tunnel_name, day) )`,
+  `CREATE INDEX IF NOT EXISTS idx_tsd_day ON tunnel_seen_days (day)`,
   `CREATE TABLE IF NOT EXISTS cron_metadata ( key TEXT PRIMARY KEY, value TEXT NOT NULL )`,
   `CREATE TABLE IF NOT EXISTS billing_p95 ( period TEXT NOT NULL, tunnel_name TEXT NOT NULL, direction TEXT NOT NULL, p95_bps REAL NOT NULL, sample_count INTEGER NOT NULL, computed_at TEXT NOT NULL, PRIMARY KEY (period, tunnel_name, direction) )`,
 ];

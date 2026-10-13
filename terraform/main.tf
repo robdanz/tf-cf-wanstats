@@ -143,8 +143,25 @@ resource "null_resource" "migrate_0005" {
   }
 }
 
+resource "null_resource" "migrate_0006" {
+  depends_on = [null_resource.migrate_0005, local_file.wrangler_jsonc]
+
+  triggers = {
+    migration_hash = filesha256("${path.module}/../migrations/0006_tunnel_seen_days.sql")
+    database_id    = cloudflare_d1_database.metrics.id
+  }
+
+  provisioner "local-exec" {
+    working_dir = "${path.module}/../worker"
+    command     = "npx wrangler d1 execute tf-cf-wanstats-metrics --remote --file=${abspath(path.module)}/../migrations/0006_tunnel_seen_days.sql"
+    environment = {
+      CLOUDFLARE_API_TOKEN = var.cloudflare_api_token
+    }
+  }
+}
+
 resource "null_resource" "deploy" {
-  depends_on = [null_resource.migrate, null_resource.migrate_0002, null_resource.migrate_0003, null_resource.migrate_0004, null_resource.migrate_0005]
+  depends_on = [null_resource.migrate, null_resource.migrate_0002, null_resource.migrate_0003, null_resource.migrate_0004, null_resource.migrate_0005, null_resource.migrate_0006]
 
   triggers = {
     # Hash every file under worker/src so any change — including a new file —

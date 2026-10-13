@@ -164,7 +164,8 @@ describe('repollHours', () => {
 
     await repollHours(TEST_ENV, now);
 
-    const names = await DB.prepare("SELECT tunnel_name || '@' || ts AS k FROM tunnel_metrics WHERE direction = 'egress' AND ts >= '2026-09-20T01:00:00Z' AND ts < '2026-09-20T02:00:00Z' ORDER BY k").all<{ k: string }>();
+    // Real rows only; roster tunnels get FILL_BIT_RATE elsewhere (fill.test.ts).
+    const names = await DB.prepare("SELECT tunnel_name || '@' || ts AS k FROM tunnel_metrics WHERE direction = 'egress' AND ts >= '2026-09-20T01:00:00Z' AND ts < '2026-09-20T02:00:00Z' AND bit_rate != 1025 ORDER BY k").all<{ k: string }>();
     expect(names.results.map((r) => r.k)).toEqual(['STAYS@2026-09-20T01:30:00Z']);
     const text = await (await BUCKET.get('raw/2026-09-20/01.csv'))!.text();
     expect(text).not.toContain('DROPPED,');

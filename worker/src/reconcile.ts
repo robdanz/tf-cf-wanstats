@@ -5,6 +5,7 @@ import {
 } from './d1';
 import { writeRawToR2 } from './r2';
 import { snapToHour, snapToDay } from './utils';
+import { fillHourFromD1 } from './fill';
 
 // The hour ledger. Every full run walks hours from the persisted
 // `reconciled_through` watermark and, per hour, (1) tracks buckets with no
@@ -44,14 +45,21 @@ async function reconcileHour(env: Env, hour: Date, now: Date): Promise<void> {
   const missing = await findMissingBuckets(env.DB, start, end);
   if (missing.length > 0) await insertGapBuckets(env.DB, missing, now.toISOString());
 
+  // Every roster tunnel gets a value in every bucket from here on: missing
+  // keys are filled with FILL_BIT_RATE in D1 before the rollup and the R2
+  // rebuild (fill.ts). The re-polls replace fills with any real value later.
+  const { ingress, egress } = await getRawRowsForHour(env.DB, start, end);
+  const fills = await fillHourFromD1(env.DB, hour, ingress, egress);
+
   const rollupChanges = await rollupHour(env.DB, hour.toISOString());
 
-  const { ingress, egress } = await getRawRowsForHour(env.DB, start, end);
+  const allIngress = ingress.concat(fills.ingress);
+  const allEgress = egress.concat(fills.egress);
   let r2Rows = 0;
-  if (ingress.length + egress.length > 0) {
+  if (allIngress.length + allEgress.length > 0) {
     // Merge-by-key writer: identical content is a harmless rewrite, a
     // missing or short hour is filled from D1. No GraphQL calls.
-    r2Rows = (await writeRawToR2(env.RAW_METRICS, ingress, egress)).totalRows;
+    r2Rows = (await writeRawToR2(env.RAW_METRICS, allIngress, allEgress)).totalRows;
   }
 
   if (hour.getUTCHours() === 23) {
@@ -60,7 +68,7 @@ async function reconcileHour(env: Env, hour: Date, now: Date): Promise<void> {
     console.log(`Ledger rollupDay ${day}: ${dayChanges} rows`);
   }
 
-  console.log(`Ledger ${start}: ${missing.length} new gap bucket(s), rollup ${rollupChanges} rows, R2 ${r2Rows} rows`);
+  console.log(`Ledger ${start}: ${missing.length} new gap bucket(s), ${fills.ingress.length + fills.egress.length} fill(s), rollup ${rollupChanges} rows, R2 ${r2Rows} rows`);
 }
 
 export async function reconcileHours(

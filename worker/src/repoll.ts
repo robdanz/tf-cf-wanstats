@@ -1,10 +1,9 @@
 import type { Env } from './types';
 import { fetchMetricsTimeSliced } from './graphql';
-import { storeTunnelMetrics, pruneRawRows, keepKeys, rollupHour, rollupDay, getMetadata, setMetadata, deleteResolvedGapBuckets } from './d1';
-import { writeRawToR2, bucketsWithRows } from './r2';
+import { rollupHour, rollupDay, getMetadata, setMetadata, deleteResolvedGapBuckets } from './d1';
 import { snapToHour, snapToDay } from './utils';
 import { hourKey } from './reconcile';
-import { withAbsentRowFills } from './fill';
+import { storeRefetch } from './fill';
 
 // The late re-poll. Cloudflare rewrites magicTransitNetworkAnalyticsAdaptiveGroups
 // well after the fact: measured on the lab tenant (2026-09-20), buckets are
@@ -77,17 +76,8 @@ async function repollHour(env: Env, hour: Date): Promise<{ ok: boolean; ingress:
 
   // Replace, not merge: after this the hour's D1 rows and R2 object are
   // exactly what the source returned for every bucket it answered for, plus
-  // a FILL_BIT_RATE row for each tunnel/direction live in the hour that the
-  // source has no row for in an answered bucket (fill.ts).
-  const replace = bucketsWithRows(fetched.ingress, fetched.egress);
-  const { ingress, egress, filled } = withAbsentRowFills(fetched.ingress, fetched.egress);
-  await Promise.all([
-    Promise.all([
-      storeTunnelMetrics(env.DB, ingress, 'ingress'),
-      storeTunnelMetrics(env.DB, egress, 'egress'),
-    ]).then(() => pruneRawRows(env.DB, replace, keepKeys(ingress, egress))),
-    writeRawToR2(env.RAW_METRICS, ingress, egress, replace),
-  ]);
+  // a FILL_BIT_RATE row for every other roster tunnel/direction (fill.ts).
+  const { filled, answered: replace } = await storeRefetch(env, hour, end, fetched, false);
 
   // A bucket that has rows now is no longer a gap, whatever the retry
   // schedule concluded about it.

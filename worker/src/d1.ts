@@ -258,6 +258,8 @@ export async function purgeOldData(db: D1Database): Promise<{
   // retention, so nothing here is still being repaired. ≤288 rows/day worst
   // case; the PK range is enough.
   const gapResult = await db.prepare('DELETE FROM gap_buckets WHERE ts < ?').bind(rawTs(dailyCutoff)).run();
+  // Fill roster: as long as the daily rollups (~900 rows/day at 900 tunnels).
+  await db.prepare('DELETE FROM tunnel_seen_days WHERE day < ?').bind(rawTs(dailyCutoff).slice(0, 10)).run();
 
   return {
     rawDeleted,
@@ -285,6 +287,46 @@ export async function getRawRowsForHour(
   const toRows = (rows: Row[]): NormalizedRow[] =>
     rows.map((r) => ({ tunnelName: r.tunnel_name, ts: r.ts, bitRate: r.bit_rate }));
   return { ingress: toRows(ing.results), egress: toRows(eg.results) };
+}
+
+// ── Fill roster (fill.ts) ───────────────────────────────────────────────────
+
+// Record the UTC days on which each tunnel had real rows, keeping the first
+// ts per day. Callers pass real rows only (no fills). A write happens only
+// for a new (tunnel, day) or an earlier first ts, so re-recording an hour is
+// a read.
+export async function recordSeen(db: D1Database, rows: NormalizedRow[]): Promise<void> {
+  const first = new Map<string, string>();
+  for (const r of rows) {
+    const k = `${r.tunnelName}\u0000${r.ts.slice(0, 10)}`;
+    const prev = first.get(k);
+    if (prev === undefined || r.ts < prev) first.set(k, r.ts);
+  }
+  const entries = Array.from(first.entries());
+  for (let i = 0; i < entries.length; i += BATCH_SIZE) {
+    await batch(db, entries.slice(i, i + BATCH_SIZE).map(([k, ts]) => {
+      const [tunnelName, day] = k.split('\u0000');
+      return db.prepare(`
+        INSERT INTO tunnel_seen_days (tunnel_name, day, first_ts) VALUES (?, ?, ?)
+        ON CONFLICT (tunnel_name, day) DO UPDATE SET first_ts = excluded.first_ts
+          WHERE excluded.first_ts < first_ts
+      `).bind(tunnelName, day, ts);
+    }), 'recordSeen');
+  }
+}
+
+// Tunnels expected to report in hour `hourStart`: seen on any of the
+// `days` days before its UTC day, or earlier on its own day than the
+// hour's end. A tunnel seen for the first time later on is not expected yet.
+export async function getRoster(db: D1Database, hourStart: Date, days: number): Promise<string[]> {
+  const day = hourStart.toISOString().slice(0, 10);
+  const from = new Date(Date.parse(`${day}T00:00:00Z`) - days * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const hourEnd = rawTs(new Date(hourStart.getTime() + 60 * 60 * 1000));
+  const { results } = await db.prepare(`
+    SELECT DISTINCT tunnel_name FROM tunnel_seen_days
+    WHERE (day >= ?1 AND day < ?2) OR (day = ?2 AND first_ts < ?3)
+  `).bind(from, day, hourEnd).all<{ tunnel_name: string }>();
+  return results.map((r) => r.tunnel_name);
 }
 
 // MIN(ts) over one direction is an index-range read; a bare MIN(ts) would

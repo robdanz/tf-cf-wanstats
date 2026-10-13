@@ -67,7 +67,8 @@ describe('handleCron full run', () => {
 
     expect(await getMetadata(DB, 'last_full_run_ok')).toBe('true');
     expect(await getMetadata(DB, 'last_tunnel_count')).toBe('1');
-    const count = await DB.prepare("SELECT COUNT(*) AS n FROM tunnel_metrics WHERE tunnel_name = 'CRON_OK'").first<{ n: number }>();
+    // Real rows only: the ledger also fills roster keys with FILL_BIT_RATE (fill.ts).
+    const count = await DB.prepare("SELECT COUNT(*) AS n FROM tunnel_metrics WHERE tunnel_name = 'CRON_OK' AND bit_rate != 1025").first<{ n: number }>();
     expect(count?.n).toBe(13); // 65-minute window -> 13 complete buckets
     expect(await getMetadata(DB, 'reconciled_through')).toBe('2026-08-11T08:00:00Z');
   });
