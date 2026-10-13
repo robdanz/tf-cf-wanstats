@@ -4,6 +4,7 @@ import { storeTunnelMetrics, pruneRawRows, keepKeys, rollupHour, rollupDay, getM
 import { writeRawToR2, bucketsWithRows } from './r2';
 import { snapToHour, snapToDay } from './utils';
 import { hourKey } from './reconcile';
+import { withAbsentRowFills } from './fill';
 
 // The late re-poll. Cloudflare rewrites magicTransitNetworkAnalyticsAdaptiveGroups
 // well after the fact: measured on the lab tenant (2026-09-20), buckets are
@@ -63,19 +64,23 @@ export interface RepollPassResult {
   stalledOn: string | null;
 }
 
-async function repollHour(env: Env, hour: Date): Promise<{ ok: boolean; ingress: number; egress: number }> {
+async function repollHour(env: Env, hour: Date): Promise<{ ok: boolean; ingress: number; egress: number; filled: number }> {
   const end = new Date(hour.getTime() + HOUR_MS);
-  const { ingress, egress, failedSlices, sliceCount } = await fetchMetricsTimeSliced(
+  const fetched = await fetchMetricsTimeSliced(
     env.ACCOUNT_ID, env.WAN_API_TOKEN, hour, end,
   );
+  const { failedSlices, sliceCount } = fetched;
   if (failedSlices.length > 0) {
     console.warn(`Repoll ${hourKey(hour)}: ${failedSlices.length}/${sliceCount} slice(s) failed; will retry next run`);
-    return { ok: false, ingress: 0, egress: 0 };
+    return { ok: false, ingress: 0, egress: 0, filled: 0 };
   }
 
   // Replace, not merge: after this the hour's D1 rows and R2 object are
-  // exactly what the source returned for every bucket it answered for.
-  const replace = bucketsWithRows(ingress, egress);
+  // exactly what the source returned for every bucket it answered for, plus
+  // a FILL_BIT_RATE row for each tunnel/direction live in the hour that the
+  // source has no row for in an answered bucket (fill.ts).
+  const replace = bucketsWithRows(fetched.ingress, fetched.egress);
+  const { ingress, egress, filled } = withAbsentRowFills(fetched.ingress, fetched.egress);
   await Promise.all([
     Promise.all([
       storeTunnelMetrics(env.DB, ingress, 'ingress'),
@@ -92,7 +97,7 @@ async function repollHour(env: Env, hour: Date): Promise<{ ok: boolean; ingress:
   if (hour.getUTCHours() === 23) {
     await rollupDay(env.DB, snapToDay(hour).toISOString());
   }
-  return { ok: true, ingress: ingress.length, egress: egress.length };
+  return { ok: true, ingress: fetched.ingress.length, egress: fetched.egress.length, filled };
 }
 
 async function repollPass(env: Env, now: Date, delayH: number, deadlineAt: number): Promise<RepollPassResult> {
@@ -122,7 +127,7 @@ async function repollPass(env: Env, now: Date, delayH: number, deadlineAt: numbe
     const r = await repollHour(env, hour);
     if (!r.ok) { stalledOn = hourKey(hour); break; }
     await setMetadata(env.DB, key, hourKey(hour));
-    console.log(`Repoll ${delayH}h ${hourKey(hour)}: ${r.ingress} ingress + ${r.egress} egress rows`);
+    console.log(`Repoll ${delayH}h ${hourKey(hour)}: ${r.ingress} ingress + ${r.egress} egress rows, ${r.filled} fill(s)`);
     watermark = hour;
     hour = new Date(hour.getTime() + HOUR_MS);
     processed++;

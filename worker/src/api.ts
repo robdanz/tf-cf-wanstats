@@ -26,6 +26,7 @@ import { fetchMetricsTimeSliced } from './graphql';
 import { writeRawToR2, bucketsWithRows, streamCsvExport, cleanupRawDay } from './r2';
 import { toPeriod, snapToHour, snapToDay } from './utils';
 import { REPOLL_DELAYS_H, repollKey, newestEligibleHour } from './repoll';
+import { withAbsentRowFills } from './fill';
 
 const VALID_SORT_COLUMNS: Record<string, string> = {
   'name': 'tunnel_name',
@@ -506,7 +507,7 @@ async function handleBackfill(request: Request, env: Env): Promise<Response> {
     return new Response('start must be before end', { status: 400 });
   }
 
-  const { ingress, egress, warnings, failedSlices, sliceCount } = await fetchMetricsTimeSliced(
+  const { ingress: fetchedIngress, egress: fetchedEgress, warnings, failedSlices, sliceCount } = await fetchMetricsTimeSliced(
     env.ACCOUNT_ID,
     env.WAN_API_TOKEN,
     new Date(start),
@@ -536,7 +537,10 @@ async function handleBackfill(request: Request, env: Env): Promise<Response> {
 
   // Replace, not merge, for every bucket the source answered for: R2 (and
   // D1 within retention) end up exactly equal to the source for the window.
-  const replace = bucketsWithRows(ingress, egress);
+  // Tunnel/directions live in an hour but absent from an answered bucket get
+  // a FILL_BIT_RATE row, as in the re-poll (fill.ts).
+  const replace = bucketsWithRows(fetchedIngress, fetchedEgress);
+  const { ingress, egress, filled } = withAbsentRowFills(fetchedIngress, fetchedEgress);
   await Promise.all([
     archiveOnly ? Promise.resolve() : Promise.all([
       storeTunnelMetrics(env.DB, ingress, 'ingress'),
@@ -576,8 +580,9 @@ async function handleBackfill(request: Request, env: Env): Promise<Response> {
   return Response.json({
     start,
     end,
-    ingress_rows: ingress.length,
-    egress_rows: egress.length,
+    ingress_rows: fetchedIngress.length,
+    egress_rows: fetchedEgress.length,
+    filled_rows: filled,
     failed_slices: failedSlices,
     warnings,
     mode: archiveOnly ? 'archive' : 'raw',
